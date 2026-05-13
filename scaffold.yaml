@@ -1,0 +1,39 @@
+project_title: a-table-store-library
+version: "0.1.0"
+description: "A dynamically scaffolded c/cmake project"
+stack: c/cmake
+date_created: 2026-05-13
+
+profile: default
+
+base_templates:
+  repo: https://github.com/contactandyc/scaffold-templates.git
+  ref: main
+
+scaffold_repo:
+  repo: https://github.com/contactandyc/scaffold-repo.git
+  ref: main
+
+# ── Dynamic Setup Variables ──
+c_standard: "23"
+cxx_standard: "17"
+
+# ── 3. Licenses & Legal ──
+# license_profile: apache-2.0
+# license_overrides:
+#   "src/vendor/**": mit
+
+# ── 4. Dependencies ──
+depends_on:
+  - https://github.com/contactandyc/a-memory-library.git
+  - https://github.com/contactandyc/a-bloom-filter-library.git
+  - https://github.com/contactandyc/the-macro-library.git
+  - https://github.com/contactandyc/the-lz4-library.git
+
+examples:
+  depends_on:
+    - https://github.com/contactandyc/sql-parser-library.git
+  sql-example:
+    targets:
+      sql_example:
+        - src/main.c
