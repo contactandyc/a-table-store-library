@@ -42,7 +42,7 @@ bool memtable_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
 
 /* Read a primary record (Multi-Reader lock-free). Returns NULL if deleted or not found. */
 const void *memtable_get(memtable_t *mt, const void *key, uint32_t key_len,
-                         uint64_t read_seq_num, uint32_t *out_len);
+                         uint64_t read_seq_num, uint32_t *out_len, bool *is_deleted);
 
 /* Primary Iterators (for flushing to SSTable) */
 memtable_row_t *memtable_first(memtable_t *mt);

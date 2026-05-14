@@ -11,6 +11,7 @@
 #include "the-lz4-library/lz4/lz4.h"
 #include "the-lz4-library/xxhash.h"
 #include "a-bloom-filter-library/bloom.h"
+#include "a-memory-library/aml_alloc.h"
 
 #define TARGET_BLOCK_SIZE 16384
 #define IO_BUFFER_SIZE    1048576
@@ -62,27 +63,27 @@ static inline int encode_varint32(uint8_t *dst, uint32_t value) {
 }
 
 sstable_builder_t *sstable_builder_init(const char *filepath, size_t expected_elements) {
-    sstable_builder_t *b = (sstable_builder_t *)calloc(1, sizeof(sstable_builder_t));
+    sstable_builder_t *b = (sstable_builder_t *)aml_zalloc( sizeof(sstable_builder_t));
 
     b->file = fopen(filepath, "wb");
-    if (!b->file) { free(b); return NULL; }
+    if (!b->file) { aml_free(b); return NULL; }
     setvbuf(b->file, NULL, _IONBF, 0);
 
     b->block_capacity = TARGET_BLOCK_SIZE + 4096;
-    b->block_buf = (uint8_t *)malloc(b->block_capacity);
+    b->block_buf = (uint8_t *)aml_malloc(b->block_capacity);
 
-    b->io_buf = (uint8_t *)malloc(IO_BUFFER_SIZE);
+    b->io_buf = (uint8_t *)aml_malloc(IO_BUFFER_SIZE);
 
     b->lz4_scratch_cap = (size_t)LZ4_compressBound((int)b->block_capacity);
-    b->lz4_scratch = (uint8_t *)malloc(b->lz4_scratch_cap);
+    b->lz4_scratch = (uint8_t *)aml_malloc(b->lz4_scratch_cap);
 
     b->restarts_cap = 256;
-    b->restarts = (uint32_t *)malloc(b->restarts_cap * sizeof(uint32_t));
+    b->restarts = (uint32_t *)aml_malloc(b->restarts_cap * sizeof(uint32_t));
     b->restarts[0] = 0;
     b->num_restarts = 1;
 
     b->index_cap = 65536; // 64KB initial index
-    b->index_buf = (uint8_t *)malloc(b->index_cap);
+    b->index_buf = (uint8_t *)aml_malloc(b->index_cap);
 
     b->bloom = bloom_init(expected_elements, BLOOM_FP_RATE);
     return b;
@@ -118,7 +119,7 @@ static void flush_data_block(sstable_builder_t *b) {
     size_t required_idx = 4 + b->last_key_len + 8 + 8;
     if (b->index_pos + required_idx > b->index_cap) {
         b->index_cap *= 2;
-        b->index_buf = (uint8_t *)realloc(b->index_buf, b->index_cap);
+        b->index_buf = (uint8_t *)aml_realloc(b->index_buf, b->index_cap);
     }
     memcpy(&b->index_buf[b->index_pos], &b->last_key_len, 4); b->index_pos += 4;
     memcpy(&b->index_buf[b->index_pos], b->last_key, b->last_key_len); b->index_pos += b->last_key_len;
@@ -149,12 +150,9 @@ static void flush_data_block(sstable_builder_t *b) {
 bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
     if (b->block_pos > TARGET_BLOCK_SIZE) flush_data_block(b);
 
-    /*
-     * Key injected into builder is the Internal Key.
-     * We add the whole Internal Key to the Bloom filter for exact version checks,
-     * though many databases only add the User Key prefix.
-     */
-    bloom_add(b->bloom, key, key_len);
+    // --- FIX 2: Only hash the User Key into the Bloom Filter! ---
+    uint32_t user_key_len = key_len >= 8 ? key_len - 8 : key_len;
+    bloom_add(b->bloom, key, user_key_len);
 
     const char *key_str = (const char *)key;
     uint32_t shared = 0;
@@ -162,7 +160,7 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
     if (b->entry_count % RESTART_INTERVAL == 0) {
         if (b->num_restarts >= b->restarts_cap) {
             b->restarts_cap *= 2;
-            b->restarts = (uint32_t *)realloc(b->restarts, b->restarts_cap * sizeof(uint32_t));
+            b->restarts = (uint32_t *)aml_realloc(b->restarts, b->restarts_cap * sizeof(uint32_t));
         }
         if (b->block_pos > 0) b->restarts[b->num_restarts++] = (uint32_t)b->block_pos;
     } else {
@@ -222,8 +220,8 @@ uint64_t sstable_builder_finish(sstable_builder_t *b) {
 
     fclose(b->file);
     bloom_destroy(b->bloom);
-    free(b->block_buf); free(b->io_buf); free(b->lz4_scratch); free(b->restarts); free(b->index_buf);
-    free(b);
+    aml_free(b->block_buf); aml_free(b->io_buf); aml_free(b->lz4_scratch); aml_free(b->restarts); aml_free(b->index_buf);
+    aml_free(b);
 
     return final_size;
 }

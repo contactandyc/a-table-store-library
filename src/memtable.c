@@ -5,6 +5,7 @@
 
 #include "a-table-store-library/memtable.h"
 #include "a-memory-library/aml_pool.h"
+#include "a-memory-library/aml_alloc.h"
 #include "the-macro-library/macro_skiplist.h"
 #include <string.h>
 
@@ -141,12 +142,6 @@ static int memtable_index_kv_cmp(const index_lookup_t *lookup, const memtable_ro
     if (c != 0) return c;
     if (lookup->sec_key_len != row->sec_key_len) return lookup->sec_key_len < row->sec_key_len ? -1 : 1;
 
-    /*
-     * If the secondary keys match exactly, the lookup is mathematically "shorter"
-     * than the row (because the row also has a primary key appended to it).
-     * Returning -1 (lookup < row) forces lower_bound to branch left, perfectly
-     * landing on the VERY FIRST PrimaryKey+SeqNum entry for this SecondaryKey.
-     */
     return -1;
 }
 
@@ -159,7 +154,7 @@ macro_skiplist_lower_bound_kv_with_field(memtable_index_sl_lower_bound, link, in
  * -------------------------------------------------------------------------- */
 
 memtable_t *memtable_init(size_t pool_size, size_t mem_limit) {
-    memtable_t *mt = (memtable_t *)malloc(sizeof(memtable_t));
+    memtable_t *mt = (memtable_t *)aml_malloc(sizeof(memtable_t));
     if (!mt) return NULL;
 
     mt->pool = aml_pool_init(pool_size);
@@ -176,7 +171,7 @@ memtable_t *memtable_init(size_t pool_size, size_t mem_limit) {
 void memtable_destroy(memtable_t *mt) {
     if (!mt) return;
     aml_pool_destroy(mt->pool);
-    free(mt);
+    aml_free(mt);
 }
 
 /* --------------------------------------------------------------------------
@@ -208,14 +203,20 @@ bool memtable_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
     return memtable_sl_insert(mt->head, row);
 }
 
+// --- FIX 1: Explicit Tombstone Reporting ---
 const void *memtable_get(memtable_t *mt, const void *key, uint32_t key_len,
-                         uint64_t read_seq_num, uint32_t *out_len) {
+                         uint64_t read_seq_num, uint32_t *out_len, bool *is_deleted) {
+    if (is_deleted) *is_deleted = false;
 
     memtable_lookup_t lookup = { .key = (const char *)key, .key_len = key_len, .seq_num = read_seq_num };
     memtable_row_t *row = memtable_sl_lower_bound(mt->head, &lookup);
 
     if (!row || row->key_len != key_len || memcmp(internal_row_key(row), key, key_len) != 0) return NULL;
-    if (row->op_type == OP_DELETE) return NULL;
+
+    if (row->op_type == OP_DELETE) {
+        if (is_deleted) *is_deleted = true; // Mark as explicitly deleted!
+        return NULL;
+    }
 
     if (out_len) *out_len = row->val_len;
     return internal_row_val(row);

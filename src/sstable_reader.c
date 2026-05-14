@@ -11,6 +11,7 @@
 #include "the-lz4-library/lz4/lz4.h"
 #include "the-lz4-library/xxhash.h"
 #include "a-bloom-filter-library/bloom.h"
+#include "a-memory-library/aml_alloc.h"
 
 #define SSTABLE_MAGIC 0x424C4F434B4C534DULL
 
@@ -62,7 +63,7 @@ sstable_reader_t *sstable_reader_init(const char *filepath) {
 
     if (magic != SSTABLE_MAGIC) { fclose(f); return NULL; }
 
-    sstable_reader_t *r = (sstable_reader_t *)calloc(1, sizeof(sstable_reader_t));
+    sstable_reader_t *r = (sstable_reader_t *)aml_zalloc( sizeof(sstable_reader_t));
     r->file = f;
 
     fseek(f, bloom_offset, SEEK_SET);
@@ -72,25 +73,25 @@ sstable_reader_t *sstable_reader_init(const char *filepath) {
 
     size_t bits_bytes = (bloom_bits + 7) / 8;
 
-    r->bloom = (bloom_t *)calloc(1, sizeof(bloom_t));
+    r->bloom = (bloom_t *)aml_zalloc( sizeof(bloom_t));
     r->bloom->num_bits = bloom_bits;
     r->bloom->num_hashes = bloom_hashes;
-    r->bloom->bits = (uint8_t *)malloc(bits_bytes);
+    r->bloom->bits = (uint8_t *)aml_malloc(bits_bytes);
     fread(r->bloom->bits, 1, bits_bytes, f);
 
     fseek(f, index_offset, SEEK_SET);
     fread(&r->num_index_entries, 4, 1, f);
 
-    r->index = (index_entry_t *)malloc(r->num_index_entries * sizeof(index_entry_t));
+    r->index = (index_entry_t *)aml_malloc(r->num_index_entries * sizeof(index_entry_t));
     for (uint32_t i = 0; i < r->num_index_entries; i++) {
         fread(&r->index[i].key_len, 4, 1, f);
-        r->index[i].key = (char *)malloc(r->index[i].key_len);
+        r->index[i].key = (char *)aml_malloc(r->index[i].key_len);
         fread(r->index[i].key, 1, r->index[i].key_len, f);
         fread(&r->index[i].offset, 8, 1, f);
         fread(&r->index[i].size, 8, 1, f);
     }
 
-    r->lz4_scratch = (uint8_t *)malloc(32768);
+    r->lz4_scratch = (uint8_t *)aml_malloc(32768);
 
     return r;
 }
@@ -99,10 +100,10 @@ void sstable_reader_destroy(sstable_reader_t *r) {
     if (!r) return;
     fclose(r->file);
     bloom_destroy(r->bloom);
-    for (uint32_t i = 0; i < r->num_index_entries; i++) free(r->index[i].key);
-    free(r->index);
-    free(r->lz4_scratch);
-    free(r);
+    for (uint32_t i = 0; i < r->num_index_entries; i++) aml_free(r->index[i].key);
+    aml_free(r->index);
+    aml_free(r->lz4_scratch);
+    aml_free(r);
 }
 
 /* --------------------------------------------------------------------------
@@ -133,7 +134,7 @@ void *sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len,
     if (target_idx == -1) return NULL;
 
     index_entry_t *idx = &r->index[target_idx];
-    uint8_t *disk_buf = (uint8_t *)malloc(idx->size);
+    uint8_t *disk_buf = (uint8_t *)aml_malloc(idx->size);
 
     fseek(r->file, idx->offset, SEEK_SET);
     fread(disk_buf, 1, idx->size, r->file);
@@ -143,14 +144,14 @@ void *sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len,
     memcpy(&file_crc, &disk_buf[idx->size - 4], 4);
 
     uint32_t actual_crc = XXH32(disk_buf, idx->size - 5, 0);
-    if (actual_crc != file_crc) { free(disk_buf); return NULL; }
+    if (actual_crc != file_crc) { aml_free(disk_buf); return NULL; }
 
     uint8_t *block = disk_buf;
     size_t block_size = idx->size - 5;
 
     if (flag == 1) { // COMPRESS_LZ4
         int decomp_size = LZ4_decompress_safe((const char*)disk_buf, (char*)r->lz4_scratch, block_size, 32768);
-        if (decomp_size < 0) { free(disk_buf); return NULL; }
+        if (decomp_size < 0) { aml_free(disk_buf); return NULL; }
         block = r->lz4_scratch;
         block_size = decomp_size;
     }
@@ -179,10 +180,10 @@ void *sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len,
         if (cmp == 0) cmp = (key_len < current_key_len) ? -1 : (key_len > current_key_len ? 1 : 0);
 
         if (cmp == 0) {
-            void *val = malloc(vlen);
+            void *val = aml_malloc(vlen);
             memcpy(val, ptr, vlen);
             if (out_val_len) *out_val_len = vlen;
-            free(disk_buf);
+            aml_free(disk_buf);
             return val;
         } else if (cmp < 0) {
             break;
@@ -191,7 +192,7 @@ void *sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len,
         ptr += vlen;
     }
 
-    free(disk_buf);
+    aml_free(disk_buf);
     return NULL;
 }
 
@@ -224,20 +225,20 @@ static bool iter_load_next_block(sstable_iter_t *iter) {
     index_entry_t *idx = &iter->reader->index[iter->current_block_idx];
     iter->current_block_idx++;
 
-    uint8_t *disk_buf = (uint8_t *)malloc(idx->size);
+    uint8_t *disk_buf = (uint8_t *)aml_malloc(idx->size);
     fseek(iter->reader->file, idx->offset, SEEK_SET);
     fread(disk_buf, 1, idx->size, iter->reader->file);
 
     uint8_t flag = disk_buf[idx->size - 5];
     size_t block_size = idx->size - 5;
 
-    if (iter->current_block_buf) free(iter->current_block_buf);
+    if (iter->current_block_buf) aml_free(iter->current_block_buf);
 
     if (flag == 1) { // COMPRESS_LZ4
-        iter->current_block_buf = (uint8_t *)malloc(32768);
+        iter->current_block_buf = (uint8_t *)aml_malloc(32768);
         int d_size = LZ4_decompress_safe((const char*)disk_buf, (char*)iter->current_block_buf, block_size, 32768);
         iter->current_block_size = d_size;
-        free(disk_buf);
+        aml_free(disk_buf);
     } else {
         iter->current_block_buf = disk_buf;
         iter->current_block_size = block_size;
@@ -254,7 +255,7 @@ static bool iter_load_next_block(sstable_iter_t *iter) {
 }
 
 sstable_iter_t *sstable_iter_init(sstable_reader_t *reader) {
-    sstable_iter_t *iter = calloc(1, sizeof(sstable_iter_t));
+    sstable_iter_t *iter = aml_zalloc( sizeof(sstable_iter_t));
     iter->reader = reader;
     iter->current_block_idx = 0;
     return iter;
@@ -309,6 +310,6 @@ void sstable_iter_get_meta(sstable_iter_t *iter, uint64_t *seq, uint8_t *op) {
 
 void sstable_iter_destroy(sstable_iter_t *iter) {
     if (!iter) return;
-    if (iter->current_block_buf) free(iter->current_block_buf);
-    free(iter);
+    if (iter->current_block_buf) aml_free(iter->current_block_buf);
+    aml_free(iter);
 }
