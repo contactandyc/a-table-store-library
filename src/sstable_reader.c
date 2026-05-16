@@ -176,21 +176,26 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, u
     if (target_idx == -1) return 0;
     index_entry_t *idx = &r->index[target_idx];
 
-    void *cached_block = lsm_cache_get(r->env->block_cache, r->table_id, r->file_id, idx->offset, NULL);
-    if (!cached_block) {
+    // [Phase 4A Fix] Safe handle fetching and robust pread validation
+    lsm_cache_handle_t *cache_h = lsm_cache_get(r->env->block_cache, r->table_id, r->file_id, idx->offset);
+    if (!cache_h) {
         uint8_t *disk_buf = aml_malloc(idx->size);
-        r->backend->pread(r->data_reader, disk_buf, idx->size, idx->offset);
-        cached_block = lsm_cache_put_or_get(r->env->block_cache, r->table_id, r->file_id, idx->offset, disk_buf, idx->size);
+        ssize_t b_read = r->backend->pread(r->data_reader, disk_buf, idx->size, idx->offset);
+        if (b_read < 0 || (size_t)b_read != idx->size) {
+            aml_free(disk_buf);
+            return 0; // Abort on torn/failed block read
+        }
+        cache_h = lsm_cache_put_or_get(r->env->block_cache, r->table_id, r->file_id, idx->offset, disk_buf, idx->size);
     }
 
-    uint8_t *disk_buf = (uint8_t *)cached_block;
+    uint8_t *disk_buf = (uint8_t *)lsm_cache_handle_data(cache_h, NULL);
 
     uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
     uint8_t flag = disk_buf[idx->size - 5];
     uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
 
     if (XXH32(disk_buf, idx->size - 9, 0) != file_crc) {
-        lsm_cache_release(r->env->block_cache, r->table_id, r->file_id, idx->offset);
+        lsm_cache_handle_release(r->env->block_cache, cache_h);
         return 0;
     }
 
@@ -203,7 +208,7 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, u
         int decomp_size = LZ4_decompress_safe((const char*)disk_buf, (char*)decomp_buf, idx->size - 9, uncomp_size);
         if (decomp_size < 0 || (uint32_t)decomp_size != uncomp_size) {
             aml_free(decomp_buf);
-            lsm_cache_release(r->env->block_cache, r->table_id, r->file_id, idx->offset);
+            lsm_cache_handle_release(r->env->block_cache, cache_h);
             return 0;
         }
         block = decomp_buf;
@@ -289,7 +294,7 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, u
     }
 
     if (decomp_buf) aml_free(decomp_buf);
-    lsm_cache_release(r->env->block_cache, r->table_id, r->file_id, idx->offset);
+    lsm_cache_handle_release(r->env->block_cache, cache_h);
     return status;
 }
 
@@ -324,21 +329,25 @@ static bool iter_load_next_block(sstable_iter_t *iter) {
     if (iter->current_block_idx >= iter->reader->num_index_entries) return false;
 
     if (iter->cached_offset != UINT64_MAX) {
-        lsm_cache_release(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, iter->cached_offset);
+        lsm_cache_handle_release(iter->reader->env->block_cache, (lsm_cache_handle_t*)iter->cached_offset);
         iter->cached_offset = UINT64_MAX;
     }
 
     index_entry_t *idx = &iter->reader->index[iter->current_block_idx++];
 
-    void *cached_block = lsm_cache_get(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, idx->offset, NULL);
-    if (!cached_block) {
+    lsm_cache_handle_t *cache_h = lsm_cache_get(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, idx->offset);
+    if (!cache_h) {
         uint8_t *disk_buf = aml_malloc(idx->size);
-        iter->reader->backend->pread(iter->reader->data_reader, disk_buf, idx->size, idx->offset);
-        cached_block = lsm_cache_put_or_get(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, idx->offset, disk_buf, idx->size);
+        ssize_t b_read = iter->reader->backend->pread(iter->reader->data_reader, disk_buf, idx->size, idx->offset);
+        if (b_read < 0 || (size_t)b_read != idx->size) {
+            aml_free(disk_buf);
+            return false;
+        }
+        cache_h = lsm_cache_put_or_get(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, idx->offset, disk_buf, idx->size);
     }
 
-    iter->cached_offset = idx->offset;
-    uint8_t *disk_buf = (uint8_t *)cached_block;
+    iter->cached_offset = (uint64_t)cache_h;
+    uint8_t *disk_buf = (uint8_t *)lsm_cache_handle_data(cache_h, NULL);
 
     uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
     uint8_t flag = disk_buf[idx->size - 5];
@@ -422,7 +431,7 @@ void sstable_iter_get_meta(sstable_iter_t *iter, uint64_t *seq, uint8_t *op) {
 void sstable_iter_destroy(sstable_iter_t *iter) {
     if (!iter) return;
     if (iter->cached_offset != UINT64_MAX) {
-        lsm_cache_release(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, iter->cached_offset);
+        lsm_cache_handle_release(iter->reader->env->block_cache, (lsm_cache_handle_t*)iter->cached_offset);
     }
     if (iter->owns_block_buf && iter->current_block_buf) {
         aml_free(iter->current_block_buf);

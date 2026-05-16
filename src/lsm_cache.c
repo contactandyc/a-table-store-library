@@ -9,21 +9,27 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <assert.h>
 
 #define NUM_SHARDS 64
 #define BUCKETS_PER_SHARD 2048
 
-typedef struct cache_node_s {
+struct cache_node_s {
     uint32_t table_id;
     uint64_t file_id;
     uint64_t offset;
     void *block;
     size_t size;
     int ref_count;
+
+    // [Phase 4A] O(1) Eviction metadata
+    uint32_t bucket;
     struct cache_node_s *prev;
     struct cache_node_s *next;
+    struct cache_node_s *hash_prev;
     struct cache_node_s *hash_next;
-} cache_node_t;
+};
+typedef struct cache_node_s cache_node_t;
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -38,18 +44,13 @@ struct lsm_cache_s {
     cache_shard_t shards[NUM_SHARDS];
 };
 
-// FIX: Replaced weak XOR hash with Murmur3 64-bit finalizer for uniform shard distribution
 static inline uint64_t hash_key(uint32_t tid, uint64_t fid, uint64_t off) {
-    uint64_t h = ((uint64_t)tid << 32) | tid;
-    h ^= fid;
-    h ^= (off << 17) | (off >> 47);
-
+    uint64_t h = ((uint64_t)tid * 0x9E3779B97F4A7C15ULL) ^ fid ^ ((off << 17) | (off >> 47));
     h ^= h >> 33;
     h *= 0xff51afd7ed558ccdULL;
     h ^= h >> 33;
     h *= 0xc4ceb9fe1a85ec53ULL;
     h ^= h >> 33;
-
     return h;
 }
 
@@ -75,24 +76,21 @@ static void lru_push_front(cache_shard_t *shard, cache_node_t *node) {
 
 static bool evict_from_shard(cache_shard_t *shard) {
     cache_node_t *curr = shard->lru_tail;
-    while (curr != NULL && curr->ref_count > 0) {
+    while (curr != NULL && __atomic_load_n(&curr->ref_count, __ATOMIC_ACQUIRE) > 0) {
         curr = curr->prev;
     }
     if (!curr) return false;
 
     lru_remove(shard, curr);
 
-    uint64_t h = hash_key(curr->table_id, curr->file_id, curr->offset);
-    uint32_t shard_idx, bucket;
-    get_shard_and_bucket(h, &shard_idx, &bucket);
-
-    cache_node_t **ptr = &shard->hash_table[bucket];
-    while (*ptr) {
-        if (*ptr == curr) {
-            *ptr = curr->hash_next;
-            break;
-        }
-        ptr = &(*ptr)->hash_next;
+    // [Phase 4A] O(1) Hash Unlinking
+    if (curr->hash_prev) {
+        curr->hash_prev->hash_next = curr->hash_next;
+    } else {
+        shard->hash_table[curr->bucket] = curr->hash_next;
+    }
+    if (curr->hash_next) {
+        curr->hash_next->hash_prev = curr->hash_prev;
     }
 
     shard->usage -= curr->size;
@@ -112,7 +110,7 @@ lsm_cache_t *lsm_cache_init(size_t total_capacity_bytes) {
     return cache;
 }
 
-void *lsm_cache_put_or_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, uint64_t offset, void *block, size_t block_size) {
+lsm_cache_handle_t *lsm_cache_put_or_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, uint64_t offset, void *block, size_t block_size) {
     uint64_t h = hash_key(table_id, file_id, offset);
     uint32_t shard_idx, bucket;
     get_shard_and_bucket(h, &shard_idx, &bucket);
@@ -124,13 +122,13 @@ void *lsm_cache_put_or_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_
     cache_node_t *curr = shard->hash_table[bucket];
     while (curr) {
         if (curr->table_id == table_id && curr->file_id == file_id && curr->offset == offset) {
-            curr->ref_count++;
+            __atomic_fetch_add(&curr->ref_count, 1, __ATOMIC_SEQ_CST);
             lru_remove(shard, curr);
             lru_push_front(shard, curr);
             pthread_mutex_unlock(&shard->mutex);
 
-            aml_free(block);
-            return curr->block;
+            aml_free(block); // Deduplicated!
+            return curr;
         }
         curr = curr->hash_next;
     }
@@ -145,19 +143,23 @@ void *lsm_cache_put_or_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_
     node->offset = offset;
     node->block = block;
     node->size = block_size;
+    node->bucket = bucket;
     node->ref_count = 1;
 
     node->hash_next = shard->hash_table[bucket];
+    if (node->hash_next) {
+        node->hash_next->hash_prev = node;
+    }
     shard->hash_table[bucket] = node;
 
     lru_push_front(shard, node);
     shard->usage += block_size;
 
     pthread_mutex_unlock(&shard->mutex);
-    return block;
+    return node;
 }
 
-void *lsm_cache_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, uint64_t offset, size_t *out_size) {
+lsm_cache_handle_t *lsm_cache_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, uint64_t offset) {
     uint64_t h = hash_key(table_id, file_id, offset);
     uint32_t shard_idx, bucket;
     get_shard_and_bucket(h, &shard_idx, &bucket);
@@ -169,15 +171,11 @@ void *lsm_cache_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, uin
 
     while (curr) {
         if (curr->table_id == table_id && curr->file_id == file_id && curr->offset == offset) {
-            curr->ref_count++;
+            __atomic_fetch_add(&curr->ref_count, 1, __ATOMIC_SEQ_CST);
             lru_remove(shard, curr);
             lru_push_front(shard, curr);
-
-            if (out_size) *out_size = curr->size;
-            void *ret_block = curr->block;
-
             pthread_mutex_unlock(&shard->mutex);
-            return ret_block;
+            return curr;
         }
         curr = curr->hash_next;
     }
@@ -186,26 +184,23 @@ void *lsm_cache_get(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, uin
     return NULL;
 }
 
-void lsm_cache_release(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, uint64_t offset) {
-    uint64_t h = hash_key(table_id, file_id, offset);
-    uint32_t shard_idx, bucket;
-    get_shard_and_bucket(h, &shard_idx, &bucket);
-
-    cache_shard_t *shard = &cache->shards[shard_idx];
-
-    pthread_mutex_lock(&shard->mutex);
-    cache_node_t *curr = shard->hash_table[bucket];
-    while (curr) {
-        if (curr->table_id == table_id && curr->file_id == file_id && curr->offset == offset) {
-            if (curr->ref_count > 0) {
-                curr->ref_count--;
-            }
-            break;
-        }
-        curr = curr->hash_next;
-    }
-    pthread_mutex_unlock(&shard->mutex);
+const void *lsm_cache_handle_data(lsm_cache_handle_t *handle, size_t *out_size) {
+    if (!handle) return NULL;
+    if (out_size) *out_size = handle->size;
+    return handle->block;
 }
+
+void lsm_cache_handle_release(lsm_cache_t *cache, lsm_cache_handle_t *handle) {
+    (void)cache; // Suppress unused parameter warning
+    if (!handle) return;
+
+    int val = __atomic_load_n(&handle->ref_count, __ATOMIC_ACQUIRE);
+    (void)val;   // Suppress unused variable warning if assertions are compiled out
+    assert(val > 0 && "lsm_cache_handle_release: Underflow! Handle was double released.");
+
+    __atomic_fetch_sub(&handle->ref_count, 1, __ATOMIC_SEQ_CST);
+}
+
 
 void lsm_cache_destroy(lsm_cache_t *cache) {
     if (!cache) return;

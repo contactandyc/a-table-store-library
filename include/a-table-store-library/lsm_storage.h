@@ -10,6 +10,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include <sys/types.h> // For ssize_t
+
 typedef struct lsm_storage_backend_s lsm_storage_backend_t;
 
 struct lsm_storage_backend_s {
@@ -17,7 +19,8 @@ struct lsm_storage_backend_s {
     void* (*open_writer)(const char *path);   // Truncates (SSTables)
     void* (*open_appender)(const char *path); // Appends (WAL / Manifest)
 
-    size_t (*pread)(void *ctx, void *buf, size_t size, uint64_t offset);
+    // [Phase 4A Fix] Return ssize_t to properly indicate IO errors (-1) vs EOF (0)
+    ssize_t (*pread)(void *ctx, void *buf, size_t size, uint64_t offset);
     size_t (*append)(void *ctx, const void *buf, size_t size);
 
     // Explicit sync to disk

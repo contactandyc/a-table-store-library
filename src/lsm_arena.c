@@ -17,6 +17,7 @@
 
 lsm_arena_t *lsm_arena_init(void) {
     lsm_arena_t *arena = aml_zalloc(sizeof(lsm_arena_t));
+    arena->current_chunk_size = ARENA_INITIAL_CHUNK_SIZE / 2; // [Phase 4A Fix]
     arena->current_chunk_size = ARENA_INITIAL_CHUNK_SIZE;
     arena->total_memory_used = sizeof(lsm_arena_t);
     return arena;
