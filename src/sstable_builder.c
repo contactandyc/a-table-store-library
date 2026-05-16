@@ -117,7 +117,7 @@ static void flush_data_block(sstable_builder_t *b) {
     encode_u32_le(&b->block_buf[b->block_pos], b->num_restarts);
     b->block_pos += 4;
 
-    uint32_t uncompressed_size = b->block_pos; // FIX: Cache exact size
+    uint32_t uncompressed_size = b->block_pos;
     uint8_t compression_flag = COMPRESS_NONE;
     uint8_t *final_buf = b->block_buf;
     size_t final_size = b->block_pos;
@@ -129,7 +129,6 @@ static void flush_data_block(sstable_builder_t *b) {
         compression_flag = COMPRESS_LZ4;
     }
 
-    // FIX: 9-Byte Trailer Layout -> [Uncompressed Size (4)] [Compression Flag (1)] [CRC (4)]
     uint32_t checksum = XXH32(final_buf, final_size, 0);
     uint8_t trailer[9];
     encode_u32_le(trailer, uncompressed_size);
@@ -164,8 +163,13 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
 
     size_t required_space = 15 + key_len + val_len;
 
-    if (b->block_pos + required_space > b->block_capacity) {
-        b->block_capacity = b->block_pos + required_space + 4096;
+    // FIX: Exact capacity sizing protects against buffer overflow.
+    // Includes max potential restarts (4 bytes each), trailing restart count (4 bytes),
+    // and the block 9-byte trailer, + a generous 4KB variance for LZ4 framing.
+    size_t slack = (b->restarts_cap * 4) + 4 + 9 + 4096;
+
+    if (b->block_pos + required_space + slack > b->block_capacity) {
+        b->block_capacity = b->block_pos + required_space + slack;
         b->block_buf = aml_realloc(b->block_buf, b->block_capacity);
 
         b->lz4_scratch_cap = LZ4_compressBound(b->block_capacity);

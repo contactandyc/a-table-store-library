@@ -22,7 +22,7 @@ static uint32_t last_checkpoint_table = 0;
 static bool wal_checkpoint_called = false;
 
 static void mock_wal_checkpoint(lsm_wal_t *wal, uint32_t table_id, uint64_t seq_num) {
-    (void)wal; // Suppress unused warning
+    (void)wal;
     last_checkpoint_table = table_id;
     last_checkpoint_seq = seq_num;
     wal_checkpoint_called = true;
@@ -62,7 +62,7 @@ MACRO_TEST(db_basic_put_get_delete) {
     // Delete
     MACRO_ASSERT_TRUE(lsm_db_delete(db, "usr_1", 5));
     char *v1_del = lsm_db_get(db, "usr_1", 5, &vlen);
-    MACRO_ASSERT_TRUE(v1_del == NULL); // Successfully masked
+    MACRO_ASSERT_TRUE(v1_del == NULL);
 
     lsm_db_close(db);
     lsm_env_destroy(env);
@@ -76,13 +76,9 @@ MACRO_TEST(db_force_flush_and_read_from_sstable) {
 
     lsm_db_put(db, "disk_key", 8, "disk_val", 8);
 
-    // Force write to disk
     MACRO_ASSERT_TRUE(lsm_db_force_flush(db));
-
-    // Slight pause to ensure the background thread completes the flush
     usleep(100 * 1000);
 
-    // Read (should miss active/imm memtables and hit L0 SSTable)
     uint32_t vlen;
     char *v = lsm_db_get(db, "disk_key", 8, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
@@ -99,17 +95,14 @@ MACRO_TEST(db_iterator_merges_memory_and_disk_safely) {
                                   &local_posix_backend, &local_posix_backend, 2, NULL);
     lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
 
-    // 1. Put keys in L0 Disk
     lsm_db_put(db, "A", 1, "disk_A", 6);
     lsm_db_put(db, "C", 1, "disk_C", 6);
     lsm_db_force_flush(db);
     usleep(100 * 1000);
 
-    // 2. Put keys in Active RAM
     lsm_db_put(db, "B", 1, "ram_B", 5);
-    lsm_db_put(db, "C", 1, "ram_C", 5); // Shadows disk_C
+    lsm_db_put(db, "C", 1, "ram_C", 5);
 
-    // 3. Scan
     lsm_db_iter_t *it = lsm_db_iter_init(db);
 
     const void *k, *v;
@@ -125,9 +118,9 @@ MACRO_TEST(db_iterator_merges_memory_and_disk_safely) {
 
     MACRO_ASSERT_TRUE(lsm_db_iter_next(it, &k, &klen, &v, &vlen));
     MACRO_ASSERT_TRUE(memcmp(k, "C", 1) == 0);
-    MACRO_ASSERT_TRUE(memcmp(v, "ram_C", 5) == 0); // Shadowing worked!
+    MACRO_ASSERT_TRUE(memcmp(v, "ram_C", 5) == 0);
 
-    MACRO_ASSERT_FALSE(lsm_db_iter_next(it, &k, &klen, &v, &vlen)); // EOF
+    MACRO_ASSERT_FALSE(lsm_db_iter_next(it, &k, &klen, &v, &vlen));
 
     lsm_db_iter_destroy(it);
     lsm_db_close(db);
@@ -147,10 +140,7 @@ MACRO_TEST(db_wal_checkpoint_triggered_on_flush) {
     lsm_db_put(db, "chk_key", 7, "chk_val", 7);
     lsm_db_put(db, "chk_key2", 8, "chk_val2", 8);
 
-    // Force write to disk, which must trigger the WAL checkpoint when done
     MACRO_ASSERT_TRUE(lsm_db_force_flush(db));
-
-    // Pause to ensure background job finishes
     usleep(150 * 1000);
 
     MACRO_ASSERT_TRUE(wal_checkpoint_called);
@@ -164,9 +154,6 @@ MACRO_TEST(db_wal_checkpoint_triggered_on_flush) {
 MACRO_TEST(db_memory_limit_triggers_stall_and_flush) {
     cleanup_db();
 
-    // The arena allocates in minimum 128 KB chunks.
-    // An empty DB uses 128 KB. During a flush, two memtables exist simultaneously.
-    // Set limit to 200 KB so the 1.5x stall threshold is 300 KB.
     size_t limit = 200 * 1024;
     lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, limit, 2,
                                   &local_posix_backend, &local_posix_backend, 2, NULL);
@@ -175,15 +162,61 @@ MACRO_TEST(db_memory_limit_triggers_stall_and_flush) {
     char val[1024];
     memset(val, 'A', sizeof(val));
 
-    // Insert enough data to overflow the first 128 KB chunk.
-    // This will cause the arena to allocate a second chunk (256 KB), spiking
-    // memory usage well past the 300 KB threshold, forcing the stall condvar to hit.
     for (int i = 0; i < 200; i++) {
         char key[32];
         snprintf(key, sizeof(key), "key_%d", i);
-        // If the stall condition times out, lsm_db_put returns false and this fails.
         MACRO_ASSERT_TRUE(lsm_db_put(db, key, strlen(key), val, sizeof(val)));
     }
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(db_l0_cascading_compaction_consolidates_correctly) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // 1. Create L0 SSTable File 1: Range ["item_2", "item_4"]
+    lsm_db_put(db, "item_2", 6, "old_two", 7);
+    lsm_db_put(db, "item_4", 6, "four", 4);
+    lsm_db_force_flush(db);
+    usleep(100 * 1000);
+
+    // 2. Create L0 SSTable File 2: Range ["item_3", "item_5"] -> Overlaps File 1
+    lsm_db_put(db, "item_3", 6, "three", 5);
+    lsm_db_put(db, "item_5", 6, "five", 4);
+    lsm_db_force_flush(db);
+    usleep(100 * 1000);
+
+    // 3. Create L0 SSTable File 3: Range ["item_1", "item_2"] -> Overlaps File 1, chaining them all
+    // Also explicitly shadows "item_2" with a newer value to verify sequence sorting
+    lsm_db_put(db, "item_1", 6, "one", 3);
+    lsm_db_put(db, "item_2", 6, "new_two", 7);
+    lsm_db_force_flush(db);
+    usleep(100 * 1000);
+
+    // 4. Force a 4th flush to cross COMPACTION_TRIGGER (4 files in L0)
+    // This systematically triggers lsmc_compact_level for L0.
+    // The fixed cascading L0 lookahead loop must pull in files 1, 2, and 3
+    // together into the same merge sort, consolidating them flawlessly.
+    lsm_db_put(db, "item_9", 6, "nine", 4);
+    lsm_db_force_flush(db);
+    usleep(200 * 1000); // Wait for background compaction thread to settle
+
+    // 5. Query and verify results to prove sequence priority was preserved over range overlaps
+    uint32_t vlen;
+    char *v = lsm_db_get(db, "item_2", 6, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    MACRO_ASSERT_EQ_INT(vlen, 7);
+    MACRO_ASSERT_TRUE(memcmp(v, "new_two", 7) == 0); // Must be the new one, not shadowed old_two
+    free(v);
+
+    v = lsm_db_get(db, "item_3", 6, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    MACRO_ASSERT_TRUE(memcmp(v, "three", 5) == 0);
+    free(v);
 
     lsm_db_close(db);
     lsm_env_destroy(env);
@@ -198,6 +231,7 @@ int main(void) {
     MACRO_ADD(tests, db_iterator_merges_memory_and_disk_safely);
     MACRO_ADD(tests, db_wal_checkpoint_triggered_on_flush);
     MACRO_ADD(tests, db_memory_limit_triggers_stall_and_flush);
+    MACRO_ADD(tests, db_l0_cascading_compaction_consolidates_correctly);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

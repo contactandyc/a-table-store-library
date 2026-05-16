@@ -128,18 +128,18 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
 
         uint8_t *buf = aml_malloc(record_len);
         if (m->env->router.hot_vfs->pread(reader, buf, record_len, offset) != record_len) {
-            aml_free(buf); break; // Torn write
+            aml_free(buf); break;
         }
         offset += record_len;
 
         uint8_t crc_buf[4];
         if (m->env->router.hot_vfs->pread(reader, crc_buf, 4, offset) != 4) {
-            aml_free(buf); break; // Torn write
+            aml_free(buf); break;
         }
         offset += 4;
 
         if (XXH32(buf, record_len, 0) != decode_u32_le(crc_buf)) {
-            aml_free(buf); break; // Checksum failure
+            aml_free(buf); break;
         }
 
         uint32_t src_lvl = decode_u32_le(buf);
@@ -404,16 +404,61 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
         return false;
     }
 
-    sstable_meta_t *picked_file = L_source->files[0];
-    sstable_meta_t **merge_inputs = aml_malloc((1 + L_target->num_files) * sizeof(sstable_meta_t*));
+    sstable_meta_t **source_inputs = aml_malloc(L_source->num_files * sizeof(sstable_meta_t*));
+    size_t num_source_inputs = 0;
+    source_inputs[num_source_inputs++] = L_source->files[0];
+
+    // FIX: L0 files can overlap each other. Expanding the compaction boundary
+    // prevents sequence-number inversions and "resurrecting" deleted keys.
+    if (source_level == 0) {
+        bool expanded;
+        do {
+            expanded = false;
+            for (size_t i = 0; i < L_source->num_files; i++) {
+                sstable_meta_t *cand = L_source->files[i];
+
+                bool already_in = false;
+                for(size_t j=0; j<num_source_inputs; j++) {
+                    if(source_inputs[j] == cand) { already_in = true; break; }
+                }
+                if (already_in) continue;
+
+                bool overlaps = false;
+                for(size_t j=0; j<num_source_inputs; j++) {
+                    if (lsmc_check_overlap(cand, source_inputs[j])) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (overlaps) {
+                    source_inputs[num_source_inputs++] = cand;
+                    expanded = true;
+                }
+            }
+        } while (expanded);
+    }
+
+    sstable_meta_t **merge_inputs = aml_malloc((num_source_inputs + L_target->num_files) * sizeof(sstable_meta_t*));
     size_t num_inputs = 0;
-    merge_inputs[num_inputs++] = picked_file;
+
+    for (size_t i = 0; i < num_source_inputs; i++) {
+        merge_inputs[num_inputs++] = source_inputs[i];
+    }
 
     for (size_t i = 0; i < L_target->num_files; i++) {
-        if (lsmc_check_overlap(picked_file, L_target->files[i])) {
+        bool overlaps = false;
+        for (size_t j = 0; j < num_source_inputs; j++) {
+            if (lsmc_check_overlap(source_inputs[j], L_target->files[i])) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (overlaps) {
             merge_inputs[num_inputs++] = L_target->files[i];
         }
     }
+
+    aml_free(source_inputs);
 
     sstable_reader_t **readers = aml_malloc(num_inputs * sizeof(sstable_reader_t*));
     sstable_iter_t **iters = aml_malloc(num_inputs * sizeof(sstable_iter_t*));

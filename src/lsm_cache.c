@@ -38,12 +38,18 @@ struct lsm_cache_s {
     cache_shard_t shards[NUM_SHARDS];
 };
 
+// FIX: Replaced weak XOR hash with Murmur3 64-bit finalizer for uniform shard distribution
 static inline uint64_t hash_key(uint32_t tid, uint64_t fid, uint64_t off) {
-    uint64_t h = tid;
-    h ^= (fid << 16) | (fid >> 48);
-    h ^= (off << 32) | (off >> 32);
-    h *= 0x9E3779B97F4A7C15ULL;
-    h ^= h >> 30;
+    uint64_t h = ((uint64_t)tid << 32) | tid;
+    h ^= fid;
+    h ^= (off << 17) | (off >> 47);
+
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+
     return h;
 }
 
@@ -191,7 +197,6 @@ void lsm_cache_release(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, 
     cache_node_t *curr = shard->hash_table[bucket];
     while (curr) {
         if (curr->table_id == table_id && curr->file_id == file_id && curr->offset == offset) {
-            // FIX: Saturated decrement protects against double-frees causing permanent pinning
             if (curr->ref_count > 0) {
                 curr->ref_count--;
             }

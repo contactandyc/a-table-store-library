@@ -76,6 +76,10 @@ static void perform_flush_job(void *arg) {
 
     size_t freed_mem = memtable_get_memory_usage(imm);
 
+    // FIX: Dynamically estimate element count instead of hard-coding 10,000.
+    // Assume average row overhead (key+val+pointers) is roughly 128 bytes.
+    size_t est_elements = (freed_mem / 128) + 1024; // +1024 slack for tiny dumps
+
     pthread_mutex_lock(&db->manifest->version_mutex);
     uint64_t file_id = db->manifest->next_file_id++;
     pthread_mutex_unlock(&db->manifest->version_mutex);
@@ -83,7 +87,7 @@ static void perform_flush_job(void *arg) {
     char base_path[512];
     snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)file_id);
 
-    sstable_builder_t *builder = sstable_builder_init(base_path, db->env->router.hot_vfs, FILTER_BLOOM, 10000);
+    sstable_builder_t *builder = sstable_builder_init(base_path, db->env->router.hot_vfs, FILTER_BLOOM, est_elements);
     sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
     meta->file_id = file_id;
 
