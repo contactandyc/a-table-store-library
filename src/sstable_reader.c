@@ -18,6 +18,16 @@
 #define MAX_INTERNAL_KEY_SIZE (MAX_KEY_SIZE + TRAILER_SIZE)
 #define LZ4_SCRATCH_SIZE (128 * 1024)
 
+// --- Endianness Helpers ---
+static inline uint32_t decode_u32_le(const uint8_t *src) {
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
+}
+static inline uint64_t decode_u64_le(const uint8_t *src) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= ((uint64_t)src[i]) << (i * 8);
+    return v;
+}
+
 typedef struct {
     char *key;
     uint32_t key_len;
@@ -80,8 +90,7 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
     }
 
     r->filter_type = header[4];
-    uint32_t filter_len;
-    memcpy(&filter_len, header + 5, 4);
+    uint32_t filter_len = decode_u32_le(header + 5);
 
     if (filter_len > 0) {
         uint8_t *filter_data = aml_malloc(filter_len);
@@ -90,13 +99,13 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
 
         if (r->filter_type == FILTER_BLOOM) {
             r->bloom = aml_zalloc(sizeof(bloom_t));
-            memcpy(&r->bloom->num_bits, filter_data, 8);
-            memcpy(&r->bloom->num_hashes, filter_data + 8, 8);
+            r->bloom->num_bits = decode_u64_le(filter_data);
+            r->bloom->num_hashes = decode_u64_le(filter_data + 8);
             size_t bits_bytes = (r->bloom->num_bits + 7) / 8;
             r->bloom->bits = aml_malloc(bits_bytes);
             memcpy(r->bloom->bits, filter_data + 16, bits_bytes);
         } else if (r->filter_type == FILTER_BITMAP) {
-            memcpy(&r->min_bitmap_id, filter_data, 8);
+            r->min_bitmap_id = decode_u64_le(filter_data);
             r->bitmap_cap = filter_len - 8;
             r->bitmap = aml_malloc(r->bitmap_cap);
             memcpy(r->bitmap, filter_data + 8, r->bitmap_cap);
@@ -104,9 +113,10 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
         aml_free(filter_data);
     }
 
-    uint32_t idx_len;
-    backend->pread(meta_reader, &idx_len, 4, current_offset);
+    uint8_t idx_sz_buf[4];
+    backend->pread(meta_reader, idx_sz_buf, 4, current_offset);
     current_offset += 4;
+    uint32_t idx_len = decode_u32_le(idx_sz_buf);
 
     uint8_t *idx_data = aml_malloc(idx_len);
     backend->pread(meta_reader, idx_data, idx_len, current_offset);
@@ -123,11 +133,11 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
             r->index = aml_realloc(r->index, cap * sizeof(index_entry_t));
         }
         index_entry_t *ie = &r->index[r->num_index_entries++];
-        memcpy(&ie->key_len, idx_data + ptr, 4); ptr += 4;
+        ie->key_len = decode_u32_le(idx_data + ptr); ptr += 4;
         ie->key = aml_malloc(ie->key_len);
         memcpy(ie->key, idx_data + ptr, ie->key_len); ptr += ie->key_len;
-        memcpy(&ie->offset, idx_data + ptr, 8); ptr += 8;
-        memcpy(&ie->size, idx_data + ptr, 8); ptr += 8;
+        ie->offset = decode_u64_le(idx_data + ptr); ptr += 8;
+        ie->size = decode_u64_le(idx_data + ptr); ptr += 8;
     }
 
     aml_free(idx_data);
@@ -179,8 +189,7 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
 
     uint8_t *disk_buf = (uint8_t *)cached_block;
     uint8_t flag = disk_buf[idx->size - 5];
-    uint32_t file_crc;
-    memcpy(&file_crc, &disk_buf[idx->size - 4], 4);
+    uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
 
     if (XXH32(disk_buf, idx->size - 5, 0) != file_crc) {
         lsm_cache_release(r->env->block_cache, r->table_id, r->file_id, idx->offset);
@@ -200,24 +209,20 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
         block_size = decomp_size;
     }
 
-    uint32_t num_restarts;
-    memcpy(&num_restarts, &block[block_size - 4], 4);
+    uint32_t num_restarts = decode_u32_le(&block[block_size - 4]);
     uint32_t restarts_offset = block_size - 4 - (num_restarts * 4);
 
-    // BINARY SEARCH O(log N) Restart Points
     uint32_t target_restart = 0;
     int r_left = 0, r_right = (int)num_restarts - 1;
     while (r_left <= r_right && num_restarts > 0) {
         int r_mid = r_left + (r_right - r_left) / 2;
-        uint32_t offset;
-        memcpy(&offset, &block[restarts_offset + r_mid * 4], 4);
+        uint32_t offset = decode_u32_le(&block[restarts_offset + r_mid * 4]);
         const uint8_t *p = block + offset;
 
         uint32_t shared = decode_varint32(&p);
         uint32_t unshared = decode_varint32(&p);
         uint32_t vlen = decode_varint32(&p);
 
-        // FIX: Cast to void to silence compiler warnings (we only need the side-effect of advancing 'p')
         (void)shared;
         (void)vlen;
 
@@ -235,8 +240,7 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
         }
     }
 
-    uint32_t offset;
-    memcpy(&offset, &block[restarts_offset + target_restart * 4], 4);
+    uint32_t offset = decode_u32_le(&block[restarts_offset + target_restart * 4]);
     const uint8_t *ptr = block + offset;
 
     char current_key[MAX_INTERNAL_KEY_SIZE];
@@ -259,9 +263,8 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
         if (cmp == 0) cmp = (key_len < current_user_len) ? -1 : (key_len > current_user_len ? 1 : 0);
 
         if (cmp == 0) {
-            uint64_t trailer;
-            memcpy(&trailer, current_key + current_user_len, 8);
-            uint8_t op = (uint8_t)(trailer & 0xFF);
+            const uint8_t *t = (const uint8_t *)(current_key + current_user_len);
+            uint8_t op = (uint8_t)(decode_u64_le(t) & 0xFF);
 
             if (op == 1) {
                 status = -1;
@@ -342,8 +345,7 @@ static bool iter_load_next_block(sstable_iter_t *iter) {
         iter->current_block_size = block_size;
     }
 
-    uint32_t num_restarts;
-    memcpy(&num_restarts, &iter->current_block_buf[iter->current_block_size - 4], 4);
+    uint32_t num_restarts = decode_u32_le(&iter->current_block_buf[iter->current_block_size - 4]);
     uint32_t restarts_offset = iter->current_block_size - 4 - (num_restarts * 4);
 
     iter->ptr = iter->current_block_buf;
@@ -385,8 +387,8 @@ void sstable_iter_get_kv(sstable_iter_t *iter, const char **key, uint32_t *klen,
 
 void sstable_iter_get_meta(sstable_iter_t *iter, uint64_t *seq, uint8_t *op) {
     if (iter->current_key_len >= 8) {
-        uint64_t packed;
-        memcpy(&packed, iter->current_key + (iter->current_key_len - 8), 8);
+        const uint8_t *t = (const uint8_t*)(iter->current_key + iter->current_key_len - 8);
+        uint64_t packed = decode_u64_le(t);
         *seq = packed >> 8;
         *op = (uint8_t)(packed & 0xFF);
     } else {

@@ -4,10 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "a-table-store-library/sstable_builder.h"
 #include "a-table-store-library/sstable_reader.h"
 #include "a-table-store-library/lsm_env.h"
-#include "a-table-store-library/memtable.h" // FIX: Added to expose OP_PUT / OP_DELETE
+#include "a-table-store-library/memtable.h"
+#include "a-table-store-library/lsm_compaction.h"
+#include "a-memory-library/aml_alloc.h"
 #include "the-macro-library/macro_test.h"
 
 // Helper to construct a packed internal key
@@ -15,11 +18,14 @@ static void pack_ikey(char *dst, const char *user_key, uint64_t seq, uint8_t op)
     size_t ulen = strlen(user_key);
     memcpy(dst, user_key, ulen);
     uint64_t trailer = (seq << 8) | op;
-    memcpy(dst + ulen, &trailer, 8);
+    // Pack in Little Endian to match the updated implementation requirements
+    uint8_t *t = (uint8_t *)(dst + ulen);
+    for (int i = 0; i < 8; i++) t[i] = (trailer >> (i * 8)) & 0xFF;
 }
 
 static void cleanup_files() {
     system("rm -rf /tmp/sstable_test*");
+    system("mkdir -p /tmp/sstable_test_dir");
 }
 
 MACRO_TEST(sstable_build_and_read_roundtrip) {
@@ -81,7 +87,6 @@ MACRO_TEST(sstable_tombstone_parsing_returns_negative_one) {
     void *val = NULL;
     int status = sstable_reader_get(r, "ghost", 5, &val, &vlen);
 
-    // Must return -1 to signal to the DB that older levels should be masked
     MACRO_ASSERT_EQ_INT(status, -1);
 
     sstable_reader_destroy(r);
@@ -110,7 +115,6 @@ MACRO_TEST(sstable_iterator_decodes_trailers_correctly) {
     uint32_t klen, vlen;
     sstable_iter_get_kv(it, &k, &klen, &v, &vlen);
 
-    // Iterators return Internal Keys (so length is 4 + 8 = 12)
     MACRO_ASSERT_EQ_INT(klen, 12);
     MACRO_ASSERT_TRUE(memcmp(k, "keyA", 4) == 0);
 
@@ -126,6 +130,67 @@ MACRO_TEST(sstable_iterator_decodes_trailers_correctly) {
     lsm_env_destroy(env);
 }
 
+MACRO_TEST(manifest_survives_torn_and_corrupt_writes) {
+    cleanup_files();
+    const char *dir = "/tmp/sstable_test_dir";
+
+    lsm_env_t *env = lsm_env_init(1024 * 1024, 1024 * 1024 * 10, 1,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+
+    // 1. Initialize manifest and write a valid version edit
+    lsm_manifest_t *m1 = lsmc_manifest_init(env, 1, dir);
+    sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
+    meta->file_id = 500;
+    meta->min_key_len = 12;
+    meta->min_key = aml_malloc(12);
+    pack_ikey(meta->min_key, "a", 1, OP_PUT);
+    meta->max_key_len = 12;
+    meta->max_key = aml_malloc(12);
+    pack_ikey(meta->max_key, "z", 2, OP_PUT);
+
+    sstable_meta_t *added[1] = { meta };
+    lsmc_version_edit(m1, -1, 0, NULL, 0, added, 1);
+
+    // Close m1 gracefully to force flush the writer fields
+    env->router.hot_vfs->fsync_file(m1->manifest_writer);
+    env->router.hot_vfs->close_writer(m1->manifest_writer);
+    m1->manifest_writer = NULL;
+    pthread_mutex_destroy(&m1->version_mutex);
+    lsmc_version_release(m1, m1->current_version);
+    free(m1->db_directory); free(m1);
+
+    // 2. Open the manifest file manually and corrupt the end of it (append bad data bytes)
+    char m_path[520];
+    snprintf(m_path, sizeof(m_path), "%s/CURRENT.manifest", dir);
+    FILE *f = fopen(m_path, "ab");
+    MACRO_ASSERT_TRUE(f != NULL);
+    uint32_t junk = 0xDEADBEEF;
+    fwrite(&junk, 4, 1, f); // Appending an invalid record length size
+    fclose(f);
+
+    // 3. Re-open the manifest with a fresh structure.
+    // Replay loop must hit the corrupted boundary, gracefully ignore it via checksum/length limits,
+    // and successfully yield the pristine older state instead of overflowing or crashing.
+    lsm_manifest_t *m2 = lsmc_manifest_init(env, 1, dir);
+    MACRO_ASSERT_TRUE(m2 != NULL);
+
+    lsm_version_t *v = lsmc_version_retain(m2);
+    MACRO_ASSERT_EQ_INT(v->levels[0].num_files, 1);
+    MACRO_ASSERT_EQ_INT(v->levels[0].files[0]->file_id, 500);
+
+    lsmc_version_release(m2, v);
+
+    // Cleanup m2
+    if (m2->manifest_writer) {
+        env->router.hot_vfs->close_writer(m2->manifest_writer);
+    }
+    pthread_mutex_destroy(&m2->version_mutex);
+    lsmc_version_release(m2, m2->current_version);
+    free(m2->db_directory); free(m2);
+
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -133,6 +198,7 @@ int main(void) {
     MACRO_ADD(tests, sstable_build_and_read_roundtrip);
     MACRO_ADD(tests, sstable_tombstone_parsing_returns_negative_one);
     MACRO_ADD(tests, sstable_iterator_decodes_trailers_correctly);
+    MACRO_ADD(tests, manifest_survives_torn_and_corrupt_writes);
 
     macro_run_all("lsm_sstable_disk_format", tests, test_count);
     return 0;

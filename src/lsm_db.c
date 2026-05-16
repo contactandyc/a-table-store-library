@@ -23,7 +23,8 @@
 static inline void pack_internal_key(char *dst, const void *user_key, uint32_t ulen, uint64_t seq, uint8_t op) {
     memcpy(dst, user_key, ulen);
     uint64_t trailer = (seq << 8) | op;
-    memcpy(dst + ulen, &trailer, 8);
+    uint8_t *t = (uint8_t *)(dst + ulen);
+    for (int i = 0; i < 8; i++) t[i] = (trailer >> (i * 8)) & 0xFF; // Force Little Endian
 }
 
 static inline uint32_t get_user_key_len(uint32_t internal_len) {
@@ -32,8 +33,9 @@ static inline uint32_t get_user_key_len(uint32_t internal_len) {
 
 static inline void unpack_trailer(const char *internal_key, uint32_t internal_len, uint64_t *seq, uint8_t *op) {
     if (internal_len < TRAILER_SIZE) { *seq = 0; *op = 0; return; }
-    uint64_t trailer;
-    memcpy(&trailer, internal_key + (internal_len - TRAILER_SIZE), 8);
+    const uint8_t *t = (const uint8_t *)(internal_key + (internal_len - TRAILER_SIZE));
+    uint64_t trailer = 0;
+    for (int i = 0; i < 8; i++) trailer |= ((uint64_t)t[i]) << (i * 8); // Force Little Endian Decode
     *seq = trailer >> 8;
     *op = (uint8_t)(trailer & 0xFF);
 }
@@ -50,7 +52,7 @@ struct lsm_db_s {
 
     lsm_manifest_t *manifest;
     uint64_t current_seq;
-    uint64_t imm_seq; // High-watermark of the sealed memtable
+    uint64_t imm_seq;
 
     pthread_mutex_t state_mutex;
     pthread_mutex_t write_mutex;
@@ -97,8 +99,17 @@ static void perform_flush_job(void *arg) {
         uint32_t iklen = klen + TRAILER_SIZE;
 
         sstable_builder_add(builder, ikey, iklen, v, vlen);
-        if (is_first) { memcpy(meta->min_key, ikey, iklen); meta->min_key_len = iklen; is_first = false; }
-        memcpy(meta->max_key, ikey, iklen); meta->max_key_len = iklen;
+        if (is_first) {
+            meta->min_key = aml_malloc(iklen);
+            memcpy(meta->min_key, ikey, iklen);
+            meta->min_key_len = iklen;
+            is_first = false;
+        }
+        if (meta->max_key) aml_free(meta->max_key);
+        meta->max_key = aml_malloc(iklen);
+        memcpy(meta->max_key, ikey, iklen);
+        meta->max_key_len = iklen;
+
         meta->num_entries++;
         row = memtable_next(row);
     }
@@ -107,7 +118,6 @@ static void perform_flush_job(void *arg) {
     sstable_meta_t *added[1] = { meta };
     lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1);
 
-    // FIX: Checkpoint WAL after durability is established
     if (db->env->global_wal && db->env->global_wal->checkpoint) {
         db->env->global_wal->checkpoint(db->env->global_wal, db->table_id, flushed_seq);
     }
@@ -119,7 +129,6 @@ static void perform_flush_job(void *arg) {
     pthread_cond_broadcast(&db->stall_cond);
     pthread_mutex_unlock(&db->state_mutex);
 
-    // FIX: Decrease mem usage and wake up writers stalled by limits
     atomic_fetch_sub(&db->env->global_mem_usage, freed_mem);
     pthread_mutex_lock(&db->env->global_mem_mutex);
     pthread_cond_broadcast(&db->env->global_mem_cond);
@@ -172,11 +181,8 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
     lsm_db_t *db = aml_zalloc(sizeof(lsm_db_t));
     db->env = env;
     db->table_id = table_id;
-
-    // Safety against overrun
     strncpy(db->db_dir, db_directory, sizeof(db->db_dir) - 1);
     db->db_dir[sizeof(db->db_dir) - 1] = '\0';
-
     db->ref_count = 1;
 
     db->manifest = lsmc_manifest_init(env, table_id, db_directory);
@@ -213,15 +219,12 @@ void lsm_db_release(lsm_db_t *db) {
 void lsm_db_close(lsm_db_t *db) {
     if (!db) return;
 
-    // Step 1: Prevent new calls from the environment
     lsm_env_unregister_db(db->env, db);
 
-    // Step 2: Wait for user queries (puts/gets/iterators) to drain
     while (__atomic_load_n(&db->ref_count, __ATOMIC_SEQ_CST) > 1) {
         usleep(1000);
     }
 
-    // Step 3: Trigger final flush
     pthread_mutex_lock(&db->write_mutex);
     if (memtable_first(db->memtable)) {
         db->imm_memtable = db->memtable;
@@ -240,14 +243,12 @@ void lsm_db_close(lsm_db_t *db) {
     }
     pthread_mutex_unlock(&db->write_mutex);
 
-    // Step 4: Linearly wait for background jobs to finish
     pthread_mutex_lock(&db->state_mutex);
     while (db->imm_memtable != NULL || db->is_flushing || db->is_compacting) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
     pthread_mutex_unlock(&db->state_mutex);
 
-    // Step 5: Teardown
     atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
     memtable_release(db->memtable);
 
@@ -287,7 +288,7 @@ bool lsm_db_force_flush(lsm_db_t *db) {
     }
 
     db->imm_memtable = db->memtable;
-    db->imm_seq = db->current_seq; // FIX: Mark high watermark
+    db->imm_seq = db->current_seq;
     db->memtable = memtable_init();
     atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
 
@@ -324,14 +325,13 @@ void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t 
     atomic_fetch_add(&db->env->global_mem_usage, diff);
 }
 
-// FIX: Wait on condvar instead of cpu spinning
 static bool stall_for_memory(lsm_env_t *env) {
     bool stall_failed = false;
     pthread_mutex_lock(&env->global_mem_mutex);
     while (atomic_load(&env->global_mem_usage) > (size_t)(env->global_mem_limit * 1.5)) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5; // 5-second max write stall
+        ts.tv_sec += 5;
         int rc = pthread_cond_timedwait(&env->global_mem_cond, &env->global_mem_mutex, &ts);
         if (rc != 0) {
             stall_failed = true;
@@ -345,7 +345,7 @@ static bool stall_for_memory(lsm_env_t *env) {
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
     if (key_len > MAX_KEY_SIZE) return false;
 
-    lsm_db_retain(db); // FIX: Ensure safe db shutdown
+    lsm_db_retain(db);
 
     pthread_mutex_lock(&db->write_mutex);
     uint64_t seq = ++db->current_seq;
@@ -402,7 +402,7 @@ bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
 }
 
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint32_t *out_val_len) {
-    lsm_db_retain(db); // FIX: Ensure db is safe during whole operation
+    lsm_db_retain(db);
 
     if (key_len > MAX_KEY_SIZE) {
         lsm_db_release(db);
@@ -532,7 +532,7 @@ cleanup:
     if (imm) memtable_release(imm);
     lsmc_version_release(db->manifest, v);
 
-    lsm_db_release(db); // Release the wrap lock
+    lsm_db_release(db);
     return ret_val;
 }
 
@@ -625,7 +625,7 @@ static void advance_source(lsm_db_iter_t *it, iter_node_t *n) {
 }
 
 lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db) {
-    lsm_db_retain(db); // FIX: Ensure DB survives iteration
+    lsm_db_retain(db);
 
     lsm_db_iter_t *it = aml_zalloc(sizeof(lsm_db_iter_t));
     it->db = db;
@@ -752,6 +752,6 @@ void lsm_db_iter_destroy(lsm_db_iter_t *it) {
     aml_free(it->ret_val_buf);
     aml_free(it->readers); aml_free(it->iters); aml_free(it->heap);
 
-    lsm_db_release(it->db); // FIX: Match retain count
+    lsm_db_release(it->db);
     aml_free(it);
 }

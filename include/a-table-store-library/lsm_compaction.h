@@ -26,9 +26,9 @@ typedef struct {
     uint64_t file_size;
     uint32_t num_entries;
 
-    char min_key[MAX_INTERNAL_KEY_SIZE];
+    char *min_key; // FIX: Dynamic allocation to save memory
     uint32_t min_key_len;
-    char max_key[MAX_INTERNAL_KEY_SIZE];
+    char *max_key; // FIX: Dynamic allocation to save memory
     uint32_t max_key_len;
 
     int ref_count;

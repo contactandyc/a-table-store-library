@@ -5,9 +5,26 @@
 
 #include "a-table-store-library/lsm_compaction.h"
 #include "a-memory-library/aml_alloc.h"
+#include "the-lz4-library/xxhash.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// --- Endianness Helpers ---
+static inline void encode_u32_le(uint8_t *dst, uint32_t v) {
+    dst[0] = v & 0xFF; dst[1] = (v >> 8) & 0xFF; dst[2] = (v >> 16) & 0xFF; dst[3] = (v >> 24) & 0xFF;
+}
+static inline uint32_t decode_u32_le(const uint8_t *src) {
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
+}
+static inline void encode_u64_le(uint8_t *dst, uint64_t v) {
+    for (int i = 0; i < 8; i++) dst[i] = (v >> (i * 8)) & 0xFF;
+}
+static inline uint64_t decode_u64_le(const uint8_t *src) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= ((uint64_t)src[i]) << (i * 8);
+    return v;
+}
 
 static inline uint32_t get_user_key_len(uint32_t internal_key_len) {
     return internal_key_len > INTERNAL_KEY_TRAILER_SIZE ? internal_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
@@ -102,21 +119,42 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
     if (!reader) return;
 
     uint64_t offset = 0;
-    uint32_t header[4];
 
-    while (m->env->router.hot_vfs->pread(reader, header, 16, offset) == 16) {
-        offset += 16;
-        int src_lvl = header[0];
-        int tgt_lvl = header[1];
-        uint32_t num_del = header[2];
-        uint32_t num_add = header[3];
+    while (true) {
+        uint8_t len_buf[4];
+        if (m->env->router.hot_vfs->pread(reader, len_buf, 4, offset) != 4) break;
+        uint32_t record_len = decode_u32_le(len_buf);
+        offset += 4;
+
+        uint8_t *buf = aml_malloc(record_len);
+        if (m->env->router.hot_vfs->pread(reader, buf, record_len, offset) != record_len) {
+            aml_free(buf); break; // Torn write
+        }
+        offset += record_len;
+
+        uint8_t crc_buf[4];
+        if (m->env->router.hot_vfs->pread(reader, crc_buf, 4, offset) != 4) {
+            aml_free(buf); break; // Torn write
+        }
+        offset += 4;
+
+        if (XXH32(buf, record_len, 0) != decode_u32_le(crc_buf)) {
+            aml_free(buf); break; // Checksum failure
+        }
+
+        uint32_t src_lvl = decode_u32_le(buf);
+        uint32_t tgt_lvl = decode_u32_le(buf + 4);
+        uint32_t num_del = decode_u32_le(buf + 8);
+        uint32_t num_add = decode_u32_le(buf + 12);
+        size_t ptr = 16;
 
         sstable_meta_t **d_files = NULL;
         if (num_del > 0) {
             d_files = aml_malloc(num_del * sizeof(sstable_meta_t*));
             uint64_t *d_ids = aml_malloc(num_del * 8);
-            m->env->router.hot_vfs->pread(reader, d_ids, num_del * 8, offset);
-            offset += (num_del * 8);
+            for (uint32_t d = 0; d < num_del; d++) {
+                d_ids[d] = decode_u64_le(buf + ptr); ptr += 8;
+            }
 
             lsm_version_t *curr = m->current_version;
             for (uint32_t d = 0; d < num_del; d++) {
@@ -137,14 +175,25 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         if (num_add > 0) {
             a_files = aml_malloc(num_add * sizeof(sstable_meta_t*));
             for (uint32_t a = 0; a < num_add; a++) {
-                a_files[a] = aml_zalloc(sizeof(sstable_meta_t));
-                m->env->router.hot_vfs->pread(reader, a_files[a], sizeof(sstable_meta_t), offset);
-                offset += sizeof(sstable_meta_t);
+                sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
+                a_files[a] = meta;
+                meta->ref_count = 0;
+                meta->is_obsolete = false;
 
-                a_files[a]->ref_count = 0;
-                a_files[a]->is_obsolete = false;
-                if (a_files[a]->file_id >= m->next_file_id) {
-                    m->next_file_id = a_files[a]->file_id + 1;
+                meta->file_id = decode_u64_le(buf + ptr); ptr += 8;
+                meta->file_size = decode_u64_le(buf + ptr); ptr += 8;
+                meta->num_entries = decode_u32_le(buf + ptr); ptr += 4;
+
+                meta->min_key_len = decode_u32_le(buf + ptr); ptr += 4;
+                meta->min_key = aml_malloc(meta->min_key_len);
+                memcpy(meta->min_key, buf + ptr, meta->min_key_len); ptr += meta->min_key_len;
+
+                meta->max_key_len = decode_u32_le(buf + ptr); ptr += 4;
+                meta->max_key = aml_malloc(meta->max_key_len);
+                memcpy(meta->max_key, buf + ptr, meta->max_key_len); ptr += meta->max_key_len;
+
+                if (meta->file_id >= m->next_file_id) {
+                    m->next_file_id = meta->file_id + 1;
                 }
             }
         }
@@ -152,6 +201,7 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         lsmc_version_edit(m, src_lvl, tgt_lvl, d_files, num_del, a_files, num_add);
         if (d_files) aml_free(d_files);
         if (a_files) aml_free(a_files);
+        aml_free(buf);
     }
     m->env->router.hot_vfs->close_reader(reader);
 }
@@ -178,7 +228,6 @@ lsm_manifest_t *lsmc_manifest_init(lsm_env_t *env, uint32_t table_id, const char
 
     replay_manifest(m, m_path);
 
-    // FIX: Must open the manifest in Appender Mode to prevent O_TRUNC from wiping recovery
     m->manifest_writer = m->env->router.hot_vfs->open_appender(m_path);
 
     return m;
@@ -192,9 +241,8 @@ uint64_t lsmc_get_max_sequence(lsm_manifest_t *manifest) {
         for (size_t f=0; f<v->levels[lvl].num_files; f++) {
             sstable_meta_t *meta = v->levels[lvl].files[f];
             if (meta->max_key_len >= INTERNAL_KEY_TRAILER_SIZE) {
-                uint64_t trailer;
-                memcpy(&trailer, meta->max_key + (meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE), 8);
-                uint64_t seq = trailer >> 8;
+                const uint8_t *t = (const uint8_t*)(meta->max_key + (meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE));
+                uint64_t seq = decode_u64_le(t) >> 8;
                 if (seq > max_seq) max_seq = seq;
             }
         }
@@ -230,13 +278,13 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
                     if (meta->is_obsolete) {
                         char base_path[512];
                         lsmc_generate_base_path(base_path, manifest->db_directory, meta->file_id);
-
                         char data_path[520]; snprintf(data_path, sizeof(data_path), "%s.data", base_path);
                         char meta_path[520]; snprintf(meta_path, sizeof(meta_path), "%s.meta", base_path);
-
                         vfs->delete_file(data_path);
                         vfs->delete_file(meta_path);
                     }
+                    if (meta->min_key) aml_free(meta->min_key);
+                    if (meta->max_key) aml_free(meta->max_key);
                     aml_free(meta);
                 }
             }
@@ -253,17 +301,45 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
     pthread_mutex_lock(&manifest->version_mutex);
 
     if (manifest->manifest_writer) {
-        uint32_t header[4] = { source_level, target_level, num_deleted, num_added };
-        manifest->env->router.hot_vfs->append(manifest->manifest_writer, header, 16);
+        uint32_t record_len = 16 + (num_deleted * 8);
+        for (size_t a = 0; a < num_added; a++) {
+            record_len += 8 + 8 + 4 + 4 + added_files[a]->min_key_len + 4 + added_files[a]->max_key_len;
+        }
 
-        for (size_t d=0; d<num_deleted; d++) {
-            manifest->env->router.hot_vfs->append(manifest->manifest_writer, &deleted_files[d]->file_id, 8);
+        uint8_t *buf = aml_malloc(record_len);
+        size_t ptr = 0;
+        encode_u32_le(buf + ptr, source_level); ptr += 4;
+        encode_u32_le(buf + ptr, target_level); ptr += 4;
+        encode_u32_le(buf + ptr, num_deleted); ptr += 4;
+        encode_u32_le(buf + ptr, num_added); ptr += 4;
+
+        for (size_t d = 0; d < num_deleted; d++) {
+            encode_u64_le(buf + ptr, deleted_files[d]->file_id); ptr += 8;
         }
-        for (size_t a=0; a<num_added; a++) {
-            manifest->env->router.hot_vfs->append(manifest->manifest_writer, added_files[a], sizeof(sstable_meta_t));
+
+        for (size_t a = 0; a < num_added; a++) {
+            encode_u64_le(buf + ptr, added_files[a]->file_id); ptr += 8;
+            encode_u64_le(buf + ptr, added_files[a]->file_size); ptr += 8;
+            encode_u32_le(buf + ptr, added_files[a]->num_entries); ptr += 4;
+
+            encode_u32_le(buf + ptr, added_files[a]->min_key_len); ptr += 4;
+            memcpy(buf + ptr, added_files[a]->min_key, added_files[a]->min_key_len); ptr += added_files[a]->min_key_len;
+
+            encode_u32_le(buf + ptr, added_files[a]->max_key_len); ptr += 4;
+            memcpy(buf + ptr, added_files[a]->max_key, added_files[a]->max_key_len); ptr += added_files[a]->max_key_len;
         }
-        // FIX: Ensure edit hits disk before reporting success
+
+        uint32_t crc = XXH32(buf, record_len, 0);
+        uint8_t wrap[4];
+
+        encode_u32_le(wrap, record_len);
+        manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4);
+        manifest->env->router.hot_vfs->append(manifest->manifest_writer, buf, record_len);
+        encode_u32_le(wrap, crc);
+        manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4);
+
         manifest->env->router.hot_vfs->fsync_file(manifest->manifest_writer);
+        aml_free(buf);
     }
 
     lsm_version_t *v = aml_zalloc(sizeof(lsm_version_t));
@@ -413,13 +489,19 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
 
                     new_files[num_new_files] = aml_zalloc(sizeof(sstable_meta_t));
                     new_files[num_new_files]->file_id = current_out_id;
+
+                    new_files[num_new_files]->min_key = aml_malloc(top.key_len);
                     memcpy(new_files[num_new_files]->min_key, top.key, top.key_len);
                     new_files[num_new_files]->min_key_len = top.key_len;
                 }
 
                 sstable_builder_add(builder, top.key, top.key_len, top.val, top.val_len);
+
+                if (new_files[num_new_files]->max_key) aml_free(new_files[num_new_files]->max_key);
+                new_files[num_new_files]->max_key = aml_malloc(top.key_len);
                 memcpy(new_files[num_new_files]->max_key, top.key, top.key_len);
                 new_files[num_new_files]->max_key_len = top.key_len;
+
                 new_files[num_new_files]->num_entries++;
 
                 if (sstable_builder_current_size(builder) >= TARGET_FILE_SIZE) {
