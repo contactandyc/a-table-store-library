@@ -396,17 +396,45 @@ size_t lsm_db_get_active_mem_usage(lsm_db_t *db) {
 }
 
 static bool stall_for_memory(lsm_env_t *env) {
-    bool stall_failed = false;
-    pthread_mutex_lock(&env->global_mem_mutex);
-    while (atomic_load(&env->global_mem_usage) > (size_t)(env->global_mem_limit * 1.5)) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 5;
-        int rc = pthread_cond_timedwait(&env->global_mem_cond, &env->global_mem_mutex, &ts);
-        if (rc != 0) { stall_failed = true; break; }
+    size_t usage = atomic_load(&env->global_mem_usage);
+    size_t flush_limit = env->global_mem_limit;
+
+    // [Phase 5A Fix] Soft limit kicks in at 80% of the flush limit
+    size_t soft_limit = (flush_limit * 8) / 10;
+
+    // Hard stall kicks in at 150% to allow geometric arena chunks room to breathe
+    size_t hard_stall_limit = flush_limit + (flush_limit / 2);
+
+    if (usage > soft_limit) {
+        if (usage > hard_stall_limit) {
+            // HARD STALL: We are way out of memory. Block the thread completely.
+            bool stall_failed = false;
+            pthread_mutex_lock(&env->global_mem_mutex);
+
+            // Loop in case of spurious wakeups
+            while (atomic_load(&env->global_mem_usage) > hard_stall_limit) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += 5; // 5-second safety timeout
+
+                int rc = pthread_cond_timedwait(&env->global_mem_cond, &env->global_mem_mutex, &ts);
+                if (rc != 0) {
+                    stall_failed = true;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&env->global_mem_mutex);
+            return !stall_failed;
+        } else {
+            // SOFT STALL (Backpressure): Delay the writer gracefully to let the bg_pool catch up.
+            size_t overage = usage - soft_limit;
+            size_t band = hard_stall_limit - soft_limit;
+
+            useconds_t delay = 1000 + (useconds_t)((overage * 9000) / band);
+            usleep(delay);
+        }
     }
-    pthread_mutex_unlock(&env->global_mem_mutex);
-    return !stall_failed;
+    return true;
 }
 
 void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
