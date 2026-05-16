@@ -110,7 +110,7 @@ MACRO_TEST(memtable_iteration_orders_keys_and_seqs_descending) {
     memtable_row_t *row = memtable_first(mt);
     MACRO_ASSERT_TRUE(row != NULL);
 
-    uint32_t klen, vlen;
+    uint32_t klen;
 
     // 1st: A @ 3
     const char *k = (const char *)memtable_row_get_key(row, &klen);
