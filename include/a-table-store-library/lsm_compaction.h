@@ -35,6 +35,11 @@ typedef struct {
 
     int ref_count;
     bool is_obsolete;
+
+    // [Phase 5B] Lazy-loaded, cached reader to prevent re-parsing metadata on every read
+    pthread_mutex_t reader_mutex;
+    sstable_reader_t *cached_reader;
+
 } sstable_meta_t;
 
 typedef struct {
@@ -61,7 +66,6 @@ typedef struct {
 
     void *manifest_writer;
 
-    // [Phase 3 Fix] Compaction pointers to prevent starvation
     char *compaction_pointers[MAX_LEVELS];
     uint32_t compaction_pointer_lens[MAX_LEVELS];
 

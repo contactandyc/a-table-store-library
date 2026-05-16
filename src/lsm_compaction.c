@@ -50,16 +50,15 @@ static bool lsmc_check_overlap(sstable_meta_t *a, sstable_meta_t *b) {
     uint32_t uminB = get_user_key_len(b->min_key_len);
     uint32_t min1 = umaxA < uminB ? umaxA : uminB;
     int c1 = memcmp(a->max_key, b->min_key, min1);
-    // [Phase 3 Fix] Correctly handle inclusive equality
     if (c1 == 0) c1 = umaxA < uminB ? -1 : (umaxA > uminB ? 1 : 0);
-    if (c1 < 0) return false; // A max < B min -> No overlap
+    if (c1 < 0) return false;
 
     uint32_t uminA = get_user_key_len(a->min_key_len);
     uint32_t umaxB = get_user_key_len(b->max_key_len);
     uint32_t min2 = uminA < umaxB ? uminA : umaxB;
     int c2 = memcmp(a->min_key, b->max_key, min2);
     if (c2 == 0) c2 = uminA < umaxB ? -1 : (uminA > umaxB ? 1 : 0);
-    if (c2 > 0) return false; // A min > B max -> No overlap
+    if (c2 > 0) return false;
 
     return true;
 }
@@ -181,6 +180,10 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
                 meta->ref_count = 0;
                 meta->is_obsolete = false;
 
+                // [Phase 5B Fix] Initialize caching fields for manifest-hydrated tables
+                pthread_mutex_init(&meta->reader_mutex, NULL);
+                meta->cached_reader = NULL;
+
                 meta->file_id = decode_u64_le(buf + ptr); ptr += 8;
                 meta->file_size = decode_u64_le(buf + ptr); ptr += 8;
                 meta->num_entries = decode_u32_le(buf + ptr); ptr += 4;
@@ -263,7 +266,6 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
     v->ref_count--;
 
     if (v->ref_count == 0) {
-        // [Phase 2 Fix] Gather paths before unlocking to avoid I/O inside mutex
         char **paths_to_delete = aml_malloc(MAX_LEVELS * 16 * sizeof(char*));
         size_t num_paths = 0;
         size_t paths_cap = MAX_LEVELS * 16;
@@ -281,6 +283,12 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
                 meta->ref_count--;
 
                 if (meta->ref_count == 0) {
+                    // [Phase 5B Fix] Destroy the cached reader upon metadata death
+                    if (meta->cached_reader) {
+                        sstable_reader_destroy(meta->cached_reader);
+                    }
+                    pthread_mutex_destroy(&meta->reader_mutex);
+
                     if (meta->is_obsolete) {
                         char base_path[512];
                         lsmc_generate_base_path(base_path, manifest->db_directory, meta->file_id);
@@ -314,7 +322,6 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
 
         pthread_mutex_unlock(&manifest->version_mutex);
 
-        // Safely execute file deletion off the critical path lock
         for (size_t p = 0; p < num_paths; p++) {
             vfs_for_path[p]->delete_file(paths_to_delete[p]);
             aml_free(paths_to_delete[p]);
@@ -442,7 +449,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
 
     int start_idx = 0;
 
-    // [Phase 3 Fix] Prevent Compaction Starvation by cycling through the files
     if (source_level > 0 && manifest->compaction_pointer_lens[source_level] > 0) {
         for (size_t i = 0; i < L_source->num_files; i++) {
             sstable_meta_t *m = L_source->files[i];
@@ -453,14 +459,13 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
 
             if (cmp > 0) {
                 start_idx = i;
-                break; // Found the first file AFTER our last compaction pointer
+                break;
             }
         }
     }
 
     source_inputs[num_source_inputs++] = L_source->files[start_idx];
 
-    // Cache the max_key of the files we selected to update the compaction pointer later
     uint32_t ptr_len = get_user_key_len(source_inputs[num_source_inputs-1]->max_key_len);
     char *next_ptr = aml_malloc(ptr_len);
     memcpy(next_ptr, source_inputs[num_source_inputs-1]->max_key, ptr_len);
@@ -493,8 +498,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
         } while (expanded);
     }
 
-    // ... (Overlap checking for target level remains unchanged) ...
-
     sstable_meta_t **merge_inputs = aml_malloc((num_source_inputs + L_target->num_files) * sizeof(sstable_meta_t*));
     size_t num_inputs = 0;
 
@@ -517,32 +520,40 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
 
     aml_free(source_inputs);
 
-    // ... (Heap Merge and New File creation logic remains completely unchanged from Phase 1) ...
-
-    sstable_reader_t **readers = aml_malloc(num_inputs * sizeof(sstable_reader_t*));
     sstable_iter_t **iters = aml_malloc(num_inputs * sizeof(sstable_iter_t*));
     char filepath[512];
 
     min_heap_t heap = { .data = aml_malloc(num_inputs * sizeof(heap_node_t)), .size = 0, .capacity = num_inputs };
 
     for (size_t i = 0; i < num_inputs; i++) {
-        lsmc_generate_base_path(filepath, manifest->db_directory, merge_inputs[i]->file_id);
-
+        sstable_meta_t *meta = merge_inputs[i];
         int file_level = (i < num_source_inputs) ? source_level : (source_level + 1);
         lsm_storage_backend_t *vfs = manifest->env->router.hot_vfs;
         if (file_level >= manifest->env->router.cold_storage_start_level) {
             vfs = manifest->env->router.cold_vfs;
         }
 
-        readers[i] = sstable_reader_init(filepath, vfs, manifest->env, manifest->table_id, merge_inputs[i]->file_id);
-        if (!readers[i]) {
-            for (size_t j = 0; j < i; j++) { sstable_iter_destroy(iters[j]); sstable_reader_destroy(readers[j]); }
-            aml_free(merge_inputs); aml_free(readers); aml_free(iters); aml_free(heap.data); aml_free(next_ptr);
+        // [Phase 5B Fix] Use the shared cached reader to merge data during compaction
+        sstable_reader_t *r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
+        if (!r) {
+            pthread_mutex_lock(&meta->reader_mutex);
+            r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
+            if (!r) {
+                lsmc_generate_base_path(filepath, manifest->db_directory, meta->file_id);
+                r = sstable_reader_init(filepath, vfs, manifest->env, manifest->table_id, meta->file_id);
+                __atomic_store_n(&meta->cached_reader, r, __ATOMIC_RELEASE);
+            }
+            pthread_mutex_unlock(&meta->reader_mutex);
+        }
+
+        if (!r) {
+            for (size_t j = 0; j < i; j++) { sstable_iter_destroy(iters[j]); }
+            aml_free(merge_inputs); aml_free(iters); aml_free(heap.data); aml_free(next_ptr);
             lsmc_version_release(manifest, v);
             return false;
         }
 
-        iters[i] = sstable_iter_init(readers[i]);
+        iters[i] = sstable_iter_init(r);
         if (sstable_iter_next(iters[i])) {
             heap_node_t node;
             sstable_iter_get_kv(iters[i], &node.key, &node.key_len, &node.val, &node.val_len);
@@ -610,6 +621,9 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
                 new_files[num_new_files] = aml_zalloc(sizeof(sstable_meta_t));
                 new_files[num_new_files]->file_id = current_out_id;
 
+                pthread_mutex_init(&new_files[num_new_files]->reader_mutex, NULL);
+                new_files[num_new_files]->cached_reader = NULL;
+
                 new_files[num_new_files]->min_key = aml_malloc(top.key_len);
                 memcpy(new_files[num_new_files]->min_key, top.key, top.key_len);
                 new_files[num_new_files]->min_key_len = top.key_len;
@@ -656,10 +670,8 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
 
     for (size_t i = 0; i < num_inputs; i++) {
         sstable_iter_destroy(iters[i]);
-        sstable_reader_destroy(readers[i]);
     }
 
-    // [Phase 3 Fix] Save the compaction pointer so next time we pick up where we left off
     pthread_mutex_lock(&manifest->version_mutex);
     if (manifest->compaction_pointers[source_level]) {
         aml_free(manifest->compaction_pointers[source_level]);
@@ -671,6 +683,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     lsmc_version_edit(manifest, source_level, source_level + 1, merge_inputs, num_inputs, new_files, num_new_files);
     lsmc_version_release(manifest, v);
 
-    aml_free(merge_inputs); aml_free(readers); aml_free(iters); aml_free(heap.data); aml_free(new_files);
+    aml_free(merge_inputs); aml_free(iters); aml_free(heap.data); aml_free(new_files);
     return true;
 }

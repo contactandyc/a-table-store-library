@@ -553,6 +553,118 @@ MACRO_TEST(db_compaction_overlap_and_starvation_prevention) {
     lsm_env_destroy(env);
 }
 
+// --- Phase 5B SSTable Caching Tests ---
+
+typedef struct {
+    lsm_db_t *db;
+    pthread_mutex_t *mut;
+    pthread_cond_t *cond;
+    bool *start_flag;
+    int successes;
+} cache_reader_args_t;
+
+static void *async_cache_reader(void *arg) {
+    cache_reader_args_t *args = (cache_reader_args_t *)arg;
+
+    // Synchronize thread startup to hit the cache simultaneously
+    pthread_mutex_lock(args->mut);
+    while (!*(args->start_flag)) {
+        pthread_cond_wait(args->cond, args->mut);
+    }
+    pthread_mutex_unlock(args->mut);
+
+    uint32_t vlen;
+    char *v = lsm_db_get(args->db, "hot_key", 7, UINT64_MAX, &vlen);
+    if (v && vlen == 7 && memcmp(v, "hot_val", 7) == 0) {
+        __atomic_fetch_add(&args->successes, 1, __ATOMIC_SEQ_CST);
+    }
+    if (v) free(v);
+    return NULL;
+}
+
+MACRO_TEST(db_concurrent_reads_init_cache_safely) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // Write a key and force it to disk so the memtable is empty
+    lsm_db_put(db, "hot_key", 7, "hot_val", 7);
+    lsm_db_force_flush(db);
+    usleep(50 * 1000);
+
+    int num_threads = 10;
+    pthread_t threads[10];
+    pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    bool start_flag = false;
+
+    cache_reader_args_t args = { .db = db, .mut = &mut, .cond = &cond, .start_flag = &start_flag, .successes = 0 };
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_create(&threads[i], NULL, async_cache_reader, &args);
+    }
+
+    // Unleash the read storm on the uninitialized cached reader
+    pthread_mutex_lock(&mut);
+    start_flag = true;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&mut);
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    // All threads should have successfully read the value without crashing
+    MACRO_ASSERT_EQ_INT(args.successes, num_threads);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(db_sstable_reader_caching_and_cleanup) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // Create File 1
+    lsm_db_put(db, "cache_key_1", 11, "value_1", 7);
+    lsm_db_force_flush(db);
+    usleep(50 * 1000);
+
+    // Read 1: Initializes the cache
+    uint32_t vlen;
+    char *v = lsm_db_get(db, "cache_key_1", 11, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    MACRO_ASSERT_TRUE(memcmp(v, "value_1", 7) == 0);
+    free(v);
+
+    // Read 2: Hits the active cache
+    v = lsm_db_get(db, "cache_key_1", 11, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    free(v);
+
+    // Force compaction by pushing more files past the L0 limit
+    for (int i=0; i<5; i++) {
+        char k[32]; snprintf(k, 32, "dummy_%d", i);
+        lsm_db_put(db, k, strlen(k), "val", 3);
+        lsm_db_force_flush(db);
+        usleep(20 * 1000);
+    }
+
+    // Wait for the background pool to finish compacting L0 -> L1
+    usleep(500 * 1000);
+
+    // Read 3: Reads from new L1 file (initializes new cache, old cache was safely destroyed)
+    v = lsm_db_get(db, "cache_key_1", 11, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    free(v);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -571,6 +683,9 @@ int main(void) {
     MACRO_ADD(tests, db_close_rejects_new_traffic_instantly);
     MACRO_ADD(tests, db_background_jobs_survives_db_handle_close);
     MACRO_ADD(tests, db_compaction_overlap_and_starvation_prevention);
+    MACRO_ADD(tests, db_concurrent_reads_init_cache_safely);
+    MACRO_ADD(tests, db_sstable_reader_caching_and_cleanup);
+
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;
 }

@@ -68,7 +68,7 @@ struct lsm_db_s {
 
     bool is_flushing;
     bool is_compacting;
-    bool is_closing; // [Phase 2 Fix] Shut off incoming traffic immediately
+    bool is_closing;
 };
 
 // --- Snapshots ---
@@ -113,12 +113,12 @@ static void perform_flush_job(void *arg) {
 
     pthread_mutex_lock(&db->state_mutex);
     memtable_t *imm = db->imm_memtable;
-    if (imm) memtable_retain(imm); // [Phase 2 Fix] Retain to avoid use-after-free
+    if (imm) memtable_retain(imm);
     uint64_t flushed_seq = db->imm_seq;
     pthread_mutex_unlock(&db->state_mutex);
 
     if (!imm) {
-        lsm_db_release(db); // Job is done
+        lsm_db_release(db);
         return;
     }
 
@@ -135,6 +135,10 @@ static void perform_flush_job(void *arg) {
     sstable_builder_t *builder = sstable_builder_init(base_path, db->env->router.hot_vfs, FILTER_BLOOM, est_elements);
     sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
     meta->file_id = file_id;
+
+    // [Phase 5B] Initialize caching properties on fresh SSTables
+    pthread_mutex_init(&meta->reader_mutex, NULL);
+    meta->cached_reader = NULL;
 
     bool is_first = true;
     memtable_row_t *row = memtable_first(imm);
@@ -191,7 +195,7 @@ static void perform_flush_job(void *arg) {
     pthread_cond_broadcast(&db->env->global_mem_cond);
     pthread_mutex_unlock(&db->env->global_mem_mutex);
 
-    if (imm) memtable_release(imm); // Release local retain
+    if (imm) memtable_release(imm);
 
     lsm_version_t *v = lsmc_version_retain(db->manifest);
     int target_lvl = -1;
@@ -208,13 +212,13 @@ static void perform_flush_job(void *arg) {
         pthread_mutex_lock(&db->state_mutex);
         if (!db->is_compacting) {
             db->is_compacting = true;
-            lsm_db_retain(db); // [Phase 2 Fix] Retain for the compaction job
+            lsm_db_retain(db);
             lsm_pool_submit(db->env->bg_pool, perform_compaction_job, db, JOB_PRIORITY_HIGH);
         }
         pthread_mutex_unlock(&db->state_mutex);
     }
 
-    lsm_db_release(db); // Job is done
+    lsm_db_release(db);
 }
 
 static void perform_compaction_job(void *arg) {
@@ -240,7 +244,7 @@ static void perform_compaction_job(void *arg) {
     pthread_cond_broadcast(&db->stall_cond);
     pthread_mutex_unlock(&db->state_mutex);
 
-    lsm_db_release(db); // Job is done
+    lsm_db_release(db);
 }
 
 // --- DB Lifecycle ---
@@ -281,7 +285,6 @@ void lsm_db_release(lsm_db_t *db) {
     if (!db) return;
     int prev = __atomic_fetch_sub(&db->ref_count, 1, __ATOMIC_SEQ_CST);
 
-    // [Phase 2 Fix] Wake up lsm_db_close if it's waiting for external refs to drain
     if (prev == 2) {
         pthread_mutex_lock(&db->state_mutex);
         pthread_cond_broadcast(&db->stall_cond);
@@ -299,7 +302,6 @@ void lsm_db_close(lsm_db_t *db) {
 
     lsm_env_unregister_db(db->env, db);
 
-    // [Phase 2 Fix] Zero-CPU wait for active readers & jobs to drain
     pthread_mutex_lock(&db->state_mutex);
     db->is_closing = true;
     while (__atomic_load_n(&db->ref_count, __ATOMIC_SEQ_CST) > 1) {
@@ -320,7 +322,7 @@ void lsm_db_close(lsm_db_t *db) {
 
         pthread_mutex_lock(&db->state_mutex);
         db->is_flushing = true;
-        lsm_db_retain(db); // For the flush job
+        lsm_db_retain(db);
         lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT);
         pthread_mutex_unlock(&db->state_mutex);
     }
@@ -379,7 +381,7 @@ bool lsm_db_force_flush(lsm_db_t *db) {
 
     if (!db->is_flushing) {
         db->is_flushing = true;
-        lsm_db_retain(db); // Retain for flush job
+        lsm_db_retain(db);
         lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT);
     }
 
@@ -399,23 +401,18 @@ static bool stall_for_memory(lsm_env_t *env) {
     size_t usage = atomic_load(&env->global_mem_usage);
     size_t flush_limit = env->global_mem_limit;
 
-    // [Phase 5A Fix] Soft limit kicks in at 80% of the flush limit
     size_t soft_limit = (flush_limit * 8) / 10;
-
-    // Hard stall kicks in at 150% to allow geometric arena chunks room to breathe
     size_t hard_stall_limit = flush_limit + (flush_limit / 2);
 
     if (usage > soft_limit) {
         if (usage > hard_stall_limit) {
-            // HARD STALL: We are way out of memory. Block the thread completely.
             bool stall_failed = false;
             pthread_mutex_lock(&env->global_mem_mutex);
 
-            // Loop in case of spurious wakeups
             while (atomic_load(&env->global_mem_usage) > hard_stall_limit) {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += 5; // 5-second safety timeout
+                ts.tv_sec += 5;
 
                 int rc = pthread_cond_timedwait(&env->global_mem_cond, &env->global_mem_mutex, &ts);
                 if (rc != 0) {
@@ -426,10 +423,8 @@ static bool stall_for_memory(lsm_env_t *env) {
             pthread_mutex_unlock(&env->global_mem_mutex);
             return !stall_failed;
         } else {
-            // SOFT STALL (Backpressure): Delay the writer gracefully to let the bg_pool catch up.
             size_t overage = usage - soft_limit;
             size_t band = hard_stall_limit - soft_limit;
-
             useconds_t delay = 1000 + (useconds_t)((overage * 9000) / band);
             usleep(delay);
         }
@@ -515,7 +510,6 @@ void lsm_write_batch_destroy(lsm_write_batch_t *b) {
 bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (!batch || batch->count == 0) return true;
 
-    // [Phase 2 Fix] Reject traffic if closing
     pthread_mutex_lock(&db->state_mutex);
     if (db->is_closing) {
         pthread_mutex_unlock(&db->state_mutex);
@@ -591,7 +585,7 @@ bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
     return res;
 }
 
-// [Phase 3 Fix] Extracted helper to prevent scan logic duplication
+// [Phase 5B Fix] Extracted helper utilizing lock-free reader caching
 static int check_sstable_for_get(lsm_db_t *db, sstable_meta_t *meta, int lvl, const void *key, uint32_t key_len, uint64_t read_seq_num, void **disk_val, uint32_t *local_vlen) {
     uint32_t umax = meta->max_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
     uint32_t umin = meta->min_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->min_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
@@ -599,22 +593,31 @@ static int check_sstable_for_get(lsm_db_t *db, sstable_meta_t *meta, int lvl, co
     uint32_t min_cmp_len = key_len < umin ? key_len : umin;
     int cmp_min = memcmp(key, meta->min_key, min_cmp_len);
     if (cmp_min == 0) cmp_min = (key_len < umin) ? -1 : (key_len > umin ? 1 : 0);
-    if (cmp_min < 0) return 0; // Not in range
+    if (cmp_min < 0) return 0;
 
     uint32_t max_cmp_len = key_len < umax ? key_len : umax;
     int cmp_max = memcmp(key, meta->max_key, max_cmp_len);
     if (cmp_max == 0) cmp_max = (key_len < umax) ? -1 : (key_len > umax ? 1 : 0);
-    if (cmp_max > 0) return 0; // Not in range
+    if (cmp_max > 0) return 0;
 
-    char base_path[512];
-    snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
-    lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
-    sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
+    // Look for the cached reader. If missing, initialize it exactly once across all threads.
+    sstable_reader_t *r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
+    if (!r) {
+        pthread_mutex_lock(&meta->reader_mutex);
+        r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
+        if (!r) {
+            char base_path[512];
+            snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
+            lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
+            r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
+            __atomic_store_n(&meta->cached_reader, r, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&meta->reader_mutex);
+    }
     if (!r) return 0;
 
-    int status = sstable_reader_get(r, key, key_len, read_seq_num, disk_val, local_vlen);
-    sstable_reader_destroy(r);
-    return status;
+    // Do NOT destroy 'r'. It lives as long as the sstable_meta_t lives!
+    return sstable_reader_get(r, key, key_len, read_seq_num, disk_val, local_vlen);
 }
 
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_seq_num, uint32_t *out_val_len) {
@@ -671,7 +674,6 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
         if (v->levels[lvl].num_files == 0) continue;
 
         if (lvl == 0) {
-            // [Phase 3 Fix] Scan all overlapping L0 files uniformly
             for (int f = v->levels[lvl].num_files - 1; f >= 0; f--) {
                 int status = check_sstable_for_get(db, v->levels[lvl].files[f], lvl, key, key_len, read_seq_num, &disk_val, &local_vlen);
                 if (status == 1) {
@@ -682,7 +684,6 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
                 else if (status == -1) goto cleanup;
             }
         } else {
-            // Binary search for exactly one intersecting file in L1+
             int left = 0, right = v->levels[lvl].num_files - 1, target_idx = -1;
             while(left <= right) {
                 int mid = left + (right - left)/2;
@@ -725,7 +726,7 @@ cleanup:
     return ret_val;
 }
 
-// ... iter_cmp, iter_push, iter_pop, advance_source remain unchanged ...
+// --- Iterator Utils & Setup ---
 typedef struct {
     const char *key; uint32_t klen;
     const char *val; uint32_t vlen;
@@ -743,7 +744,6 @@ struct lsm_db_iter_s {
 
     iter_node_t *heap;
     size_t heap_size;
-    sstable_reader_t **readers;
     sstable_iter_t **iters;
     size_t num_files;
 
@@ -813,7 +813,6 @@ static void advance_source(lsm_db_iter_t *it, iter_node_t *n) {
 }
 
 lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db, uint64_t read_seq_num) {
-    // [Phase 2 Fix] Reject traffic if closing
     pthread_mutex_lock(&db->state_mutex);
     if (db->is_closing) {
         pthread_mutex_unlock(&db->state_mutex);
@@ -845,7 +844,6 @@ lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db, uint64_t read_seq_num) {
     for (int i=0; i<MAX_LEVELS; i++) total_files += it->version->levels[i].num_files;
 
     it->heap = aml_malloc((2 + total_files) * sizeof(iter_node_t));
-    it->readers = aml_malloc(total_files * sizeof(sstable_reader_t*));
     it->iters = aml_malloc(total_files * sizeof(sstable_iter_t*));
 
     memtable_row_t *mrow = memtable_first(it->active);
@@ -866,16 +864,27 @@ lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db, uint64_t read_seq_num) {
         }
     }
 
-    char base_path[512];
     for (int lvl=0; lvl<MAX_LEVELS; lvl++) {
         for (size_t f=0; f<it->version->levels[lvl].num_files; f++) {
-            snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)it->version->levels[lvl].files[f]->file_id);
-            lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
-            sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, it->version->levels[lvl].files[f]->file_id);
+            sstable_meta_t *meta = it->version->levels[lvl].files[f];
+
+            // [Phase 5B Fix] Cache utilization for iterators
+            sstable_reader_t *r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
+            if (!r) {
+                pthread_mutex_lock(&meta->reader_mutex);
+                r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
+                if (!r) {
+                    char base_path[512];
+                    snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
+                    lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
+                    r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
+                    __atomic_store_n(&meta->cached_reader, r, __ATOMIC_RELEASE);
+                }
+                pthread_mutex_unlock(&meta->reader_mutex);
+            }
             if (!r) continue;
 
             sstable_iter_t *s_it = sstable_iter_init(r);
-            it->readers[it->num_files] = r;
             it->iters[it->num_files] = s_it;
             it->num_files++;
 
@@ -894,7 +903,6 @@ bool lsm_db_iter_next(lsm_db_iter_t *it, const void **key, uint32_t *klen, const
     while (it->heap_size > 0) {
         iter_node_t top = it->heap[0];
 
-        // FILTER: Skip versions newer than the snapshot
         if (top.seq > it->read_seq_num) {
             iter_pop(it); advance_source(it, &top); continue;
         }
@@ -936,14 +944,15 @@ bool lsm_db_iter_next(lsm_db_iter_t *it, const void **key, uint32_t *klen, const
 void lsm_db_iter_destroy(lsm_db_iter_t *it) {
     if (!it) return;
     for (size_t i=0; i<it->num_files; i++) {
-        sstable_iter_destroy(it->iters[i]); sstable_reader_destroy(it->readers[i]);
+        sstable_iter_destroy(it->iters[i]);
+        // [Phase 5B Fix] Iterators no longer destroy the readers!
     }
     memtable_release(it->active);
     if (it->imm) memtable_release(it->imm);
     lsmc_version_release(it->db->manifest, it->version);
 
     aml_free(it->ret_val_buf);
-    aml_free(it->readers); aml_free(it->iters); aml_free(it->heap);
+    aml_free(it->iters); aml_free(it->heap);
     lsm_db_release(it->db);
     aml_free(it);
 }
