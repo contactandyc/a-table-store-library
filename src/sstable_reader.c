@@ -16,7 +16,6 @@
 #define TRAILER_SIZE 8
 #define MAX_KEY_SIZE 1024
 #define MAX_INTERNAL_KEY_SIZE (MAX_KEY_SIZE + TRAILER_SIZE)
-#define LZ4_SCRATCH_SIZE (128 * 1024)
 
 // --- Endianness Helpers ---
 static inline uint32_t decode_u32_le(const uint8_t *src) {
@@ -50,13 +49,12 @@ struct sstable_reader_s {
 
     index_entry_t *index;
     uint32_t num_index_entries;
-
-    uint8_t *lz4_scratch;
 };
 
-static inline uint32_t decode_varint32(const uint8_t **ptr) {
+// FIX: Added 'end' boundary to prevent buffer overruns on corrupt reads
+static inline uint32_t decode_varint32(const uint8_t **ptr, const uint8_t *end) {
     uint32_t result = 0; int shift = 0;
-    while (1) {
+    while (*ptr < end) {
         uint8_t byte = **ptr; (*ptr)++;
         result |= (byte & 127) << shift;
         if (!(byte & 128)) break;
@@ -141,7 +139,6 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
     }
 
     aml_free(idx_data);
-    r->lz4_scratch = aml_malloc(LZ4_SCRATCH_SIZE);
     return r;
 }
 
@@ -188,29 +185,35 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
     }
 
     uint8_t *disk_buf = (uint8_t *)cached_block;
+
+    // FIX: Using Exact Size from the 9-Byte Trailer
+    uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
     uint8_t flag = disk_buf[idx->size - 5];
     uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
 
-    if (XXH32(disk_buf, idx->size - 5, 0) != file_crc) {
+    if (XXH32(disk_buf, idx->size - 9, 0) != file_crc) {
         lsm_cache_release(r->env->block_cache, r->table_id, r->file_id, idx->offset);
         return 0;
     }
 
     uint8_t *block = disk_buf;
-    size_t block_size = idx->size - 5;
+    size_t block_size = uncomp_size;
+    uint8_t *decomp_buf = NULL;
 
     if (flag == COMPRESS_LZ4) {
-        int decomp_size = LZ4_decompress_safe((const char*)disk_buf, (char*)r->lz4_scratch, block_size, LZ4_SCRATCH_SIZE);
-        if (decomp_size < 0) {
+        decomp_buf = aml_malloc(uncomp_size);
+        int decomp_size = LZ4_decompress_safe((const char*)disk_buf, (char*)decomp_buf, idx->size - 9, uncomp_size);
+        if (decomp_size < 0 || (uint32_t)decomp_size != uncomp_size) {
+            aml_free(decomp_buf);
             lsm_cache_release(r->env->block_cache, r->table_id, r->file_id, idx->offset);
             return 0;
         }
-        block = r->lz4_scratch;
-        block_size = decomp_size;
+        block = decomp_buf;
     }
 
     uint32_t num_restarts = decode_u32_le(&block[block_size - 4]);
     uint32_t restarts_offset = block_size - 4 - (num_restarts * 4);
+    const uint8_t *end = block + restarts_offset; // Bounds boundary
 
     uint32_t target_restart = 0;
     int r_left = 0, r_right = (int)num_restarts - 1;
@@ -219,9 +222,9 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
         uint32_t offset = decode_u32_le(&block[restarts_offset + r_mid * 4]);
         const uint8_t *p = block + offset;
 
-        uint32_t shared = decode_varint32(&p);
-        uint32_t unshared = decode_varint32(&p);
-        uint32_t vlen = decode_varint32(&p);
+        uint32_t shared = decode_varint32(&p, end);
+        uint32_t unshared = decode_varint32(&p, end);
+        uint32_t vlen = decode_varint32(&p, end);
 
         (void)shared;
         (void)vlen;
@@ -247,11 +250,10 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
     uint32_t current_key_len = 0;
     int status = 0;
 
-    const uint8_t *end = block + restarts_offset;
     while (ptr < end) {
-        uint32_t shared = decode_varint32(&ptr);
-        uint32_t unshared = decode_varint32(&ptr);
-        uint32_t vlen = decode_varint32(&ptr);
+        uint32_t shared = decode_varint32(&ptr, end);
+        uint32_t unshared = decode_varint32(&ptr, end);
+        uint32_t vlen = decode_varint32(&ptr, end);
 
         memcpy(current_key + shared, ptr, unshared); ptr += unshared;
         current_key_len = shared + unshared;
@@ -279,6 +281,7 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
         ptr += vlen;
     }
 
+    if (decomp_buf) aml_free(decomp_buf);
     lsm_cache_release(r->env->block_cache, r->table_id, r->file_id, idx->offset);
     return status;
 }
@@ -290,7 +293,6 @@ void sstable_reader_destroy(sstable_reader_t *r) {
     if (r->bitmap) aml_free(r->bitmap);
     for (uint32_t i = 0; i < r->num_index_entries; i++) aml_free(r->index[i].key);
     aml_free(r->index);
-    aml_free(r->lz4_scratch);
     aml_free(r);
 }
 
@@ -301,7 +303,7 @@ struct sstable_iter_s {
 
     uint8_t *current_block_buf;
     size_t current_block_size;
-    uint8_t *lz4_scratch;
+    bool owns_block_buf; // FIX: Allows Zero-Copy iteration for uncompressed blocks
 
     const uint8_t *ptr;
     const uint8_t *end;
@@ -329,20 +331,30 @@ static bool iter_load_next_block(sstable_iter_t *iter) {
     }
 
     iter->cached_offset = idx->offset;
-
     uint8_t *disk_buf = (uint8_t *)cached_block;
-    uint8_t flag = disk_buf[idx->size - 5];
-    size_t block_size = idx->size - 5;
 
-    if (iter->current_block_buf) { aml_free(iter->current_block_buf); iter->current_block_buf = NULL; }
+    // FIX: Using Exact Size from 9-Byte Trailer
+    uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
+    uint8_t flag = disk_buf[idx->size - 5];
+    uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
+
+    if (XXH32(disk_buf, idx->size - 9, 0) != file_crc) {
+        return false; // Silently abort iteration on corruption
+    }
+
+    if (iter->owns_block_buf && iter->current_block_buf) {
+        aml_free(iter->current_block_buf);
+    }
+    iter->current_block_buf = NULL;
 
     if (flag == COMPRESS_LZ4) {
-        iter->current_block_buf = aml_malloc(LZ4_SCRATCH_SIZE);
-        iter->current_block_size = LZ4_decompress_safe((const char*)disk_buf, (char*)iter->current_block_buf, block_size, LZ4_SCRATCH_SIZE);
+        iter->current_block_buf = aml_malloc(uncomp_size);
+        iter->current_block_size = LZ4_decompress_safe((const char*)disk_buf, (char*)iter->current_block_buf, idx->size - 9, uncomp_size);
+        iter->owns_block_buf = true;
     } else {
-        iter->current_block_buf = aml_malloc(block_size);
-        memcpy(iter->current_block_buf, disk_buf, block_size);
-        iter->current_block_size = block_size;
+        iter->current_block_buf = disk_buf; // Points directly to the cached disk memory
+        iter->current_block_size = uncomp_size;
+        iter->owns_block_buf = false;
     }
 
     uint32_t num_restarts = decode_u32_le(&iter->current_block_buf[iter->current_block_size - 4]);
@@ -357,7 +369,7 @@ sstable_iter_t *sstable_iter_init(sstable_reader_t *reader) {
     sstable_iter_t *iter = aml_zalloc(sizeof(sstable_iter_t));
     iter->reader = reader;
     iter->cached_offset = UINT64_MAX;
-    iter->lz4_scratch = aml_malloc(LZ4_SCRATCH_SIZE);
+    iter->owns_block_buf = false;
     return iter;
 }
 
@@ -366,9 +378,9 @@ bool sstable_iter_next(sstable_iter_t *iter) {
         if (!iter_load_next_block(iter)) return false;
     }
 
-    uint32_t shared = decode_varint32(&iter->ptr);
-    uint32_t unshared = decode_varint32(&iter->ptr);
-    uint32_t vlen = decode_varint32(&iter->ptr);
+    uint32_t shared = decode_varint32(&iter->ptr, iter->end);
+    uint32_t unshared = decode_varint32(&iter->ptr, iter->end);
+    uint32_t vlen = decode_varint32(&iter->ptr, iter->end);
 
     memcpy(iter->current_key + shared, iter->ptr, unshared);
     iter->ptr += unshared;
@@ -401,7 +413,8 @@ void sstable_iter_destroy(sstable_iter_t *iter) {
     if (iter->cached_offset != UINT64_MAX) {
         lsm_cache_release(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, iter->cached_offset);
     }
-    if (iter->current_block_buf) aml_free(iter->current_block_buf);
-    if (iter->lz4_scratch) aml_free(iter->lz4_scratch);
+    if (iter->owns_block_buf && iter->current_block_buf) {
+        aml_free(iter->current_block_buf);
+    }
     aml_free(iter);
 }

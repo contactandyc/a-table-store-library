@@ -191,7 +191,10 @@ void lsm_cache_release(lsm_cache_t *cache, uint32_t table_id, uint64_t file_id, 
     cache_node_t *curr = shard->hash_table[bucket];
     while (curr) {
         if (curr->table_id == table_id && curr->file_id == file_id && curr->offset == offset) {
-            curr->ref_count--;
+            // FIX: Saturated decrement protects against double-frees causing permanent pinning
+            if (curr->ref_count > 0) {
+                curr->ref_count--;
+            }
             break;
         }
         curr = curr->hash_next;

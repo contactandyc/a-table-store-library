@@ -117,6 +117,7 @@ static void flush_data_block(sstable_builder_t *b) {
     encode_u32_le(&b->block_buf[b->block_pos], b->num_restarts);
     b->block_pos += 4;
 
+    uint32_t uncompressed_size = b->block_pos; // FIX: Cache exact size
     uint8_t compression_flag = COMPRESS_NONE;
     uint8_t *final_buf = b->block_buf;
     size_t final_size = b->block_pos;
@@ -128,13 +129,15 @@ static void flush_data_block(sstable_builder_t *b) {
         compression_flag = COMPRESS_LZ4;
     }
 
+    // FIX: 9-Byte Trailer Layout -> [Uncompressed Size (4)] [Compression Flag (1)] [CRC (4)]
     uint32_t checksum = XXH32(final_buf, final_size, 0);
-    uint8_t crc_buf[4];
-    encode_u32_le(crc_buf, checksum);
+    uint8_t trailer[9];
+    encode_u32_le(trailer, uncompressed_size);
+    trailer[4] = compression_flag;
+    encode_u32_le(trailer + 5, checksum);
 
     b->backend->append(b->data_writer, final_buf, final_size);
-    b->backend->append(b->data_writer, &compression_flag, 1);
-    b->backend->append(b->data_writer, crc_buf, 4);
+    b->backend->append(b->data_writer, trailer, 9);
 
     size_t required_idx = 4 + b->last_key_len + 8 + 8;
     if (b->index_pos + required_idx > b->index_cap) {
@@ -145,7 +148,7 @@ static void flush_data_block(sstable_builder_t *b) {
     memcpy(&b->index_buf[b->index_pos], b->last_key, b->last_key_len); b->index_pos += b->last_key_len;
     encode_u64_le(&b->index_buf[b->index_pos], b->current_file_offset); b->index_pos += 8;
 
-    uint64_t disk_size = final_size + 5;
+    uint64_t disk_size = final_size + 9;
     encode_u64_le(&b->index_buf[b->index_pos], disk_size); b->index_pos += 8;
 
     b->current_file_offset += disk_size;
@@ -175,7 +178,7 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
         bloom_add(b->bloom, key, user_key_len);
     } else if (b->filter_type == FILTER_BITMAP && user_key_len >= 8) {
         uint64_t current_id;
-        memcpy(&current_id, key, 8); // Assume explicitly LE or raw user key packed already
+        memcpy(&current_id, key, 8);
 
         if (b->current_file_offset == 0 && b->entry_count == 0 && b->index_pos == 0) {
             b->min_bitmap_id = current_id;

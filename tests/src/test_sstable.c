@@ -191,6 +191,44 @@ MACRO_TEST(manifest_survives_torn_and_corrupt_writes) {
     lsm_env_destroy(env);
 }
 
+MACRO_TEST(sstable_dynamic_lz4_buffer_handling) {
+    cleanup_files();
+    lsm_env_t *env = lsm_env_init(1024 * 1024, 1024 * 1024 * 10, 1,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+
+    const char *base = "/tmp/sstable_test_04";
+    sstable_builder_t *b = sstable_builder_init(base, &local_posix_backend, FILTER_NONE, 100);
+
+    // Create a payload significantly larger than the old hard-coded 128KB scratch limit
+    // to prove that the new exact-size 9-Byte trailer allocation works perfectly.
+    size_t huge_size = 200 * 1024;
+    char *huge_val = malloc(huge_size);
+    memset(huge_val, 'X', huge_size);
+
+    char ikey[1024];
+    pack_ikey(ikey, "huge_key", 100, OP_PUT);
+
+    // Ensure compression triggers by pushing past normal block limits
+    sstable_builder_add(b, ikey, 8 + 8, huge_val, huge_size);
+    sstable_builder_finish(b);
+
+    sstable_reader_t *r = sstable_reader_init(base, &local_posix_backend, env, 1, 1);
+    MACRO_ASSERT_TRUE(r != NULL);
+
+    uint32_t vlen;
+    void *val;
+    int status = sstable_reader_get(r, "huge_key", 8, &val, &vlen);
+
+    MACRO_ASSERT_EQ_INT(status, 1);
+    MACRO_ASSERT_EQ_INT(vlen, huge_size);
+    MACRO_ASSERT_TRUE(memcmp(val, huge_val, huge_size) == 0);
+
+    free(val);
+    free(huge_val);
+    sstable_reader_destroy(r);
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -199,6 +237,7 @@ int main(void) {
     MACRO_ADD(tests, sstable_tombstone_parsing_returns_negative_one);
     MACRO_ADD(tests, sstable_iterator_decodes_trailers_correctly);
     MACRO_ADD(tests, manifest_survives_torn_and_corrupt_writes);
+    MACRO_ADD(tests, sstable_dynamic_lz4_buffer_handling);
 
     macro_run_all("lsm_sstable_disk_format", tests, test_count);
     return 0;

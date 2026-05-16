@@ -100,6 +100,32 @@ MACRO_TEST(cache_pinned_blocks_prevent_eviction_without_hanging) {
     lsm_cache_destroy(cache);
 }
 
+MACRO_TEST(cache_resists_refcount_underflow) {
+    lsm_cache_t *cache = lsm_cache_init(1024 * 1024);
+
+    void *b1 = malloc(4096);
+    lsm_cache_put_or_get(cache, 1, 99, 0, b1, 4096);
+
+    // Intentionally over-release the block
+    lsm_cache_release(cache, 1, 99, 0);
+    lsm_cache_release(cache, 1, 99, 0);
+    lsm_cache_release(cache, 1, 99, 0);
+
+    // Force LRU eviction cycle
+    for (uint64_t i = 100; i <= 600; i++) {
+        void *b = malloc(4096);
+        lsm_cache_put_or_get(cache, 1, i, 0, b, 4096);
+        lsm_cache_release(cache, 1, i, 0);
+    }
+
+    size_t sz;
+    // If the saturated decrement worked, the refcount hit 0 (not -2) and allowed
+    // the block to be naturally evicted by the LRU sweep.
+    MACRO_ASSERT_TRUE(lsm_cache_get(cache, 1, 99, 0, &sz) == NULL);
+
+    lsm_cache_destroy(cache);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -108,6 +134,7 @@ int main(void) {
     MACRO_ADD(tests, cache_deduplicates_racing_inserts);
     MACRO_ADD(tests, cache_lru_eviction_respects_capacity);
     MACRO_ADD(tests, cache_pinned_blocks_prevent_eviction_without_hanging);
+    MACRO_ADD(tests, cache_resists_refcount_underflow);
 
     macro_run_all("lsm_cache", tests, test_count);
     return 0;
