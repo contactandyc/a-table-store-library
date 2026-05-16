@@ -183,7 +183,7 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
                 meta->file_id = decode_u64_le(buf + ptr); ptr += 8;
                 meta->file_size = decode_u64_le(buf + ptr); ptr += 8;
                 meta->num_entries = decode_u32_le(buf + ptr); ptr += 4;
-                meta->max_seq = decode_u64_le(buf + ptr); ptr += 8; // [Phase 1 Fix] Deserialization
+                meta->max_seq = decode_u64_le(buf + ptr); ptr += 8;
 
                 meta->min_key_len = decode_u32_le(buf + ptr); ptr += 4;
                 meta->min_key = aml_malloc(meta->min_key_len);
@@ -262,6 +262,13 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
     v->ref_count--;
 
     if (v->ref_count == 0) {
+        // [Phase 2 Fix] Gather paths before unlocking to avoid I/O inside mutex
+        char **paths_to_delete = aml_malloc(MAX_LEVELS * 16 * sizeof(char*));
+        size_t num_paths = 0;
+        size_t paths_cap = MAX_LEVELS * 16;
+
+        lsm_storage_backend_t **vfs_for_path = aml_malloc(MAX_LEVELS * 16 * sizeof(void*));
+
         for (int i = 0; i < MAX_LEVELS; i++) {
             lsm_storage_backend_t *vfs = manifest->env->router.hot_vfs;
             if (i >= manifest->env->router.cold_storage_start_level) {
@@ -276,10 +283,24 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
                     if (meta->is_obsolete) {
                         char base_path[512];
                         lsmc_generate_base_path(base_path, manifest->db_directory, meta->file_id);
-                        char data_path[520]; snprintf(data_path, sizeof(data_path), "%s.data", base_path);
-                        char meta_path[520]; snprintf(meta_path, sizeof(meta_path), "%s.meta", base_path);
-                        vfs->delete_file(data_path);
-                        vfs->delete_file(meta_path);
+
+                        if (num_paths + 2 > paths_cap) {
+                            paths_cap *= 2;
+                            paths_to_delete = aml_realloc(paths_to_delete, paths_cap * sizeof(char*));
+                            vfs_for_path = aml_realloc(vfs_for_path, paths_cap * sizeof(void*));
+                        }
+
+                        char *data_path = aml_malloc(520);
+                        snprintf(data_path, 520, "%s.data", base_path);
+                        paths_to_delete[num_paths] = data_path;
+                        vfs_for_path[num_paths] = vfs;
+                        num_paths++;
+
+                        char *meta_path = aml_malloc(520);
+                        snprintf(meta_path, 520, "%s.meta", base_path);
+                        paths_to_delete[num_paths] = meta_path;
+                        vfs_for_path[num_paths] = vfs;
+                        num_paths++;
                     }
                     if (meta->min_key) aml_free(meta->min_key);
                     if (meta->max_key) aml_free(meta->max_key);
@@ -289,8 +310,20 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
             aml_free(v->levels[i].files);
         }
         aml_free(v);
+
+        pthread_mutex_unlock(&manifest->version_mutex);
+
+        // Safely execute file deletion off the critical path lock
+        for (size_t p = 0; p < num_paths; p++) {
+            vfs_for_path[p]->delete_file(paths_to_delete[p]);
+            aml_free(paths_to_delete[p]);
+        }
+        aml_free(paths_to_delete);
+        aml_free(vfs_for_path);
+
+    } else {
+        pthread_mutex_unlock(&manifest->version_mutex);
     }
-    pthread_mutex_unlock(&manifest->version_mutex);
 }
 
 bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_level,
@@ -301,7 +334,6 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
     if (manifest->manifest_writer) {
         uint32_t record_len = 16 + (num_deleted * 8);
         for (size_t a = 0; a < num_added; a++) {
-            // [Phase 1 Fix] Explicitly encode the max_seq (+8 bytes)
             record_len += 8 + 8 + 4 + 8 + 4 + added_files[a]->min_key_len + 4 + added_files[a]->max_key_len;
         }
 
@@ -320,7 +352,7 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
             encode_u64_le(buf + ptr, added_files[a]->file_id); ptr += 8;
             encode_u64_le(buf + ptr, added_files[a]->file_size); ptr += 8;
             encode_u32_le(buf + ptr, added_files[a]->num_entries); ptr += 4;
-            encode_u64_le(buf + ptr, added_files[a]->max_seq); ptr += 8; // [Phase 1 Fix]
+            encode_u64_le(buf + ptr, added_files[a]->max_seq); ptr += 8;
 
             encode_u32_le(buf + ptr, added_files[a]->min_key_len); ptr += 4;
             memcpy(buf + ptr, added_files[a]->min_key, added_files[a]->min_key_len); ptr += added_files[a]->min_key_len;
@@ -509,7 +541,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     uint32_t last_user_key_len = 0;
     bool is_bottom_level = (source_level + 1 == MAX_LEVELS - 1);
 
-    // [Phase 1 Fix] MVCC Data drop prevention tracking
     uint64_t last_kept_seq = UINT64_MAX;
 
     while (heap.size > 0) {
@@ -517,7 +548,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
         uint32_t top_user_len = get_user_key_len(top.key_len);
         bool same_user_key = (last_user_key_len == top_user_len && memcmp(last_user_key, top.key, top_user_len) == 0);
 
-        // [Phase 1 Fix] Deep MVCC Preservation checks
         bool drop = false;
         if (!same_user_key) {
             memcpy(last_user_key, top.key, top_user_len);
@@ -556,7 +586,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
                 new_files[num_new_files]->min_key_len = top.key_len;
             }
 
-            // Track highest sequence seen for this block
             if (top.seq > new_files[num_new_files]->max_seq) {
                 new_files[num_new_files]->max_seq = top.seq;
             }

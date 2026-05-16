@@ -405,6 +405,116 @@ MACRO_TEST(sstable_reader_defends_against_buffer_overflows) {
     lsm_env_destroy(env);
 }
 
+// --- Phase 2 Concurrency & Lifecycle Validation Tests ---
+
+typedef struct {
+    lsm_db_t *db;
+    pthread_mutex_t *mut;
+    pthread_cond_t *cond;
+    bool *start_flag;
+    bool write_result;
+} concurrent_writer_args_t;
+
+static void *async_writer_thread(void *arg) {
+    concurrent_writer_args_t *args = (concurrent_writer_args_t *)arg;
+
+    // Synchronize thread startup using standard portable mutex/condvar
+    pthread_mutex_lock(args->mut);
+    while (!*(args->start_flag)) {
+        pthread_cond_wait(args->cond, args->mut);
+    }
+    pthread_mutex_unlock(args->mut);
+
+    // Attempt a write. If the database is closing or closed, this should return false.
+    args->write_result = lsm_db_put(args->db, "concurrent_key", 14, "payload", 7);
+    return NULL;
+}
+
+struct close_runner { lsm_db_t *db; };
+
+static void *async_close_thread(void *arg) {
+    lsm_db_close(((struct close_runner*)arg)->db);
+    return NULL;
+}
+
+MACRO_TEST(db_close_rejects_new_traffic_instantly) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // Manually increment refcount to simulate an active long-running iterator or reader
+    lsm_db_retain(db);
+
+    pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    bool start_flag = false;
+
+    concurrent_writer_args_t writer_args = {
+        .db = db,
+        .mut = &mut,
+        .cond = &cond,
+        .start_flag = &start_flag,
+        .write_result = true
+    };
+
+    pthread_t thread;
+    pthread_create(&thread, NULL, async_writer_thread, &writer_args);
+
+    // Explicitly trip the closing flag inside lsm_db_close.
+    // Because we held a manual ref loop above, close will block on the condvar wait safely
+    // rather than destroying the internal pointers immediately.
+    pthread_t close_thread;
+    struct close_runner c_args = { .db = db };
+    pthread_create(&close_thread, NULL, async_close_thread, &c_args);
+
+    // Yield slightly to ensure the close sequence trips `is_closing`
+    usleep(50 * 1000);
+
+    // Give the green light to the concurrent writer to fire
+    pthread_mutex_lock(&mut);
+    start_flag = true;
+    pthread_cond_signal(&cond);
+    pthread_mutex_unlock(&mut);
+
+    pthread_join(thread, NULL);
+
+    // ASSERTION: The write must have returned false because the DB entered a closing state.
+    MACRO_ASSERT_FALSE(writer_args.write_result);
+
+    // Clean up our manual pinned reference, which triggers the CV wake up inside close
+    lsm_db_release(db);
+    pthread_join(close_thread, NULL);
+
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(db_background_jobs_survives_db_handle_close) {
+    cleanup_db();
+    // Initialize an environment with an artificially tiny memory threshold to force an immediate flush
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 1024, 1,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // Pump entries to load up the active memtable explicitly
+    char large_val[2048];
+    memset(large_val, 'z', sizeof(large_val));
+    lsm_db_put(db, "flush_me_key", 12, large_val, sizeof(large_val));
+
+    // Force a background flush sequence asynchronously
+    lsm_db_force_flush(db);
+
+    // Immediately trigger close. Thanks to our Phase 2 ref tracking,
+    // lsm_db_close will block cleanly on the condition variable until the async job releases its lease.
+    lsm_db_close(db);
+
+    // If Phase 2 job retention fails, this test will crash / throw memory faults
+    // before reaching this point due to the background worker accessing freed pointers.
+    MACRO_ASSERT_TRUE(true);
+
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -420,6 +530,8 @@ int main(void) {
     MACRO_ADD(tests, db_mvcc_survives_background_compaction);
     MACRO_ADD(tests, db_sequence_numbers_restore_correctly_on_restart);
     MACRO_ADD(tests, sstable_reader_defends_against_buffer_overflows);
+    MACRO_ADD(tests, db_close_rejects_new_traffic_instantly);
+    MACRO_ADD(tests, db_background_jobs_survives_db_handle_close);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

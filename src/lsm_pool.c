@@ -24,7 +24,9 @@ struct lsm_pool_s {
     lsm_job_node_t *queues[3];
     lsm_job_node_t *tails[3];
 
-    int active_jobs;
+    // [Phase 2 Fix] Track queued vs executing jobs to prevent premature shutdown exits
+    int queued_jobs;
+    int executing_jobs;
     bool shutdown;
 };
 
@@ -34,11 +36,11 @@ static void *worker_loop(void *arg) {
     while (true) {
         pthread_mutex_lock(&pool->queue_mutex);
 
-        while (pool->active_jobs == 0 && !pool->shutdown) {
+        while (pool->queued_jobs == 0 && !pool->shutdown) {
             pthread_cond_wait(&pool->queue_cond, &pool->queue_mutex);
         }
 
-        if (pool->shutdown && pool->active_jobs == 0) {
+        if (pool->shutdown && pool->queued_jobs == 0) {
             pthread_mutex_unlock(&pool->queue_mutex);
             break;
         }
@@ -52,7 +54,8 @@ static void *worker_loop(void *arg) {
                 if (pool->queues[p] == NULL) {
                     pool->tails[p] = NULL;
                 }
-                pool->active_jobs--;
+                pool->queued_jobs--;
+                pool->executing_jobs++; // Mark as executing while we drop the lock
                 break;
             }
         }
@@ -63,6 +66,10 @@ static void *worker_loop(void *arg) {
         if (job_node) {
             job_node->func(job_node->arg);
             aml_free(job_node);
+
+            pthread_mutex_lock(&pool->queue_mutex);
+            pool->executing_jobs--;
+            pthread_mutex_unlock(&pool->queue_mutex);
         }
     }
     return NULL;
@@ -92,6 +99,13 @@ void lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_p
 
     pthread_mutex_lock(&pool->queue_mutex);
 
+    // [Phase 2 Fix] Reject work safely if pool is shutting down
+    if (pool->shutdown) {
+        pthread_mutex_unlock(&pool->queue_mutex);
+        aml_free(node);
+        return;
+    }
+
     if (pool->tails[priority] == NULL) {
         pool->queues[priority] = node;
         pool->tails[priority] = node;
@@ -100,7 +114,7 @@ void lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_p
         pool->tails[priority] = node;
     }
 
-    pool->active_jobs++;
+    pool->queued_jobs++;
     pthread_cond_signal(&pool->queue_cond);
 
     pthread_mutex_unlock(&pool->queue_mutex);

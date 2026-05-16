@@ -116,7 +116,6 @@ void lsm_env_recover_wal(lsm_env_t *env) {
         pthread_mutex_unlock(&env->env_mutex);
 
         if (target_db) {
-            // [Phase 1 Fix] Handle Framed Batch Atomicity
             if (op == 2 /* OP_BATCH */) {
                 const uint8_t *blob = (const uint8_t*)v;
                 if (vlen >= 4) {
@@ -144,12 +143,28 @@ void lsm_env_recover_wal(lsm_env_t *env) {
     if (iter->destroy) iter->destroy(iter);
 }
 
+
 void lsm_env_destroy(lsm_env_t *env) {
     if (!env) return;
 
-    while (env->num_tables > 0) {
-        lsm_db_close(env->tables[env->num_tables - 1]);
+    // [Phase 2 Fix] Safely snapshot the table array under lock before closing to prevent teardown races
+    pthread_mutex_lock(&env->env_mutex);
+    size_t n_tables = env->num_tables;
+    lsm_db_t **tables_copy = NULL;
+    if (n_tables > 0) {
+        tables_copy = aml_malloc(n_tables * sizeof(lsm_db_t*));
+        for (size_t i = 0; i < n_tables; i++) {
+            tables_copy[i] = env->tables[i];
+            lsm_db_retain(tables_copy[i]);
+        }
     }
+    pthread_mutex_unlock(&env->env_mutex);
+
+    for (size_t i = 0; i < n_tables; i++) {
+        lsm_db_close(tables_copy[i]);
+        lsm_db_release(tables_copy[i]); // Release the retain we took above
+    }
+    if (tables_copy) aml_free(tables_copy);
 
     lsm_pool_destroy(env->bg_pool);
     lsm_cache_destroy(env->block_cache);

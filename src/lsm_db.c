@@ -58,7 +58,6 @@ struct lsm_db_s {
     uint64_t current_seq;
     uint64_t imm_seq;
 
-    // Snapshot tracking
     uint64_t *snapshots;
     size_t num_snapshots;
     size_t snapshots_cap;
@@ -69,6 +68,7 @@ struct lsm_db_s {
 
     bool is_flushing;
     bool is_compacting;
+    bool is_closing; // [Phase 2 Fix] Shut off incoming traffic immediately
 };
 
 // --- Snapshots ---
@@ -113,10 +113,14 @@ static void perform_flush_job(void *arg) {
 
     pthread_mutex_lock(&db->state_mutex);
     memtable_t *imm = db->imm_memtable;
+    if (imm) memtable_retain(imm); // [Phase 2 Fix] Retain to avoid use-after-free
     uint64_t flushed_seq = db->imm_seq;
     pthread_mutex_unlock(&db->state_mutex);
 
-    if (!imm) return;
+    if (!imm) {
+        lsm_db_release(db); // Job is done
+        return;
+    }
 
     size_t freed_mem = memtable_get_memory_usage(imm);
     size_t est_elements = (freed_mem / 128) + 1024;
@@ -135,7 +139,7 @@ static void perform_flush_job(void *arg) {
     bool is_first = true;
     memtable_row_t *row = memtable_first(imm);
     char ikey[MAX_INTERNAL_KEY_SIZE];
-    uint64_t block_max_seq = 0; // [Phase 1 Fix] Track sequence bounds
+    uint64_t block_max_seq = 0;
 
     while (row) {
         uint32_t klen, vlen;
@@ -174,8 +178,10 @@ static void perform_flush_job(void *arg) {
     }
 
     pthread_mutex_lock(&db->state_mutex);
-    memtable_release(db->imm_memtable);
-    db->imm_memtable = NULL;
+    if (db->imm_memtable == imm) {
+        memtable_release(db->imm_memtable);
+        db->imm_memtable = NULL;
+    }
     db->is_flushing = false;
     pthread_cond_broadcast(&db->stall_cond);
     pthread_mutex_unlock(&db->state_mutex);
@@ -184,6 +190,8 @@ static void perform_flush_job(void *arg) {
     pthread_mutex_lock(&db->env->global_mem_mutex);
     pthread_cond_broadcast(&db->env->global_mem_cond);
     pthread_mutex_unlock(&db->env->global_mem_mutex);
+
+    if (imm) memtable_release(imm); // Release local retain
 
     lsm_version_t *v = lsmc_version_retain(db->manifest);
     int target_lvl = -1;
@@ -200,10 +208,13 @@ static void perform_flush_job(void *arg) {
         pthread_mutex_lock(&db->state_mutex);
         if (!db->is_compacting) {
             db->is_compacting = true;
+            lsm_db_retain(db); // [Phase 2 Fix] Retain for the compaction job
             lsm_pool_submit(db->env->bg_pool, perform_compaction_job, db, JOB_PRIORITY_HIGH);
         }
         pthread_mutex_unlock(&db->state_mutex);
     }
+
+    lsm_db_release(db); // Job is done
 }
 
 static void perform_compaction_job(void *arg) {
@@ -228,6 +239,8 @@ static void perform_compaction_job(void *arg) {
     db->is_compacting = false;
     pthread_cond_broadcast(&db->stall_cond);
     pthread_mutex_unlock(&db->state_mutex);
+
+    lsm_db_release(db); // Job is done
 }
 
 // --- DB Lifecycle ---
@@ -254,6 +267,7 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
     pthread_cond_init(&db->stall_cond, NULL);
     db->is_flushing = false;
     db->is_compacting = false;
+    db->is_closing = false;
 
     lsm_env_register_db(env, db);
     return db;
@@ -265,7 +279,16 @@ void lsm_db_retain(lsm_db_t *db) {
 
 void lsm_db_release(lsm_db_t *db) {
     if (!db) return;
-    if (__atomic_sub_fetch(&db->ref_count, 1, __ATOMIC_SEQ_CST) == 0) {
+    int prev = __atomic_fetch_sub(&db->ref_count, 1, __ATOMIC_SEQ_CST);
+
+    // [Phase 2 Fix] Wake up lsm_db_close if it's waiting for external refs to drain
+    if (prev == 2) {
+        pthread_mutex_lock(&db->state_mutex);
+        pthread_cond_broadcast(&db->stall_cond);
+        pthread_mutex_unlock(&db->state_mutex);
+    }
+
+    if (prev == 1) {
         if (db->snapshots) aml_free(db->snapshots);
         aml_free(db);
     }
@@ -276,9 +299,13 @@ void lsm_db_close(lsm_db_t *db) {
 
     lsm_env_unregister_db(db->env, db);
 
+    // [Phase 2 Fix] Zero-CPU wait for active readers & jobs to drain
+    pthread_mutex_lock(&db->state_mutex);
+    db->is_closing = true;
     while (__atomic_load_n(&db->ref_count, __ATOMIC_SEQ_CST) > 1) {
-        usleep(1000);
+        pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
+    pthread_mutex_unlock(&db->state_mutex);
 
     pthread_mutex_lock(&db->write_mutex);
     if (memtable_first(db->memtable)) {
@@ -293,6 +320,7 @@ void lsm_db_close(lsm_db_t *db) {
 
         pthread_mutex_lock(&db->state_mutex);
         db->is_flushing = true;
+        lsm_db_retain(db); // For the flush job
         lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT);
         pthread_mutex_unlock(&db->state_mutex);
     }
@@ -351,6 +379,7 @@ bool lsm_db_force_flush(lsm_db_t *db) {
 
     if (!db->is_flushing) {
         db->is_flushing = true;
+        lsm_db_retain(db); // Retain for flush job
         lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT);
     }
 
@@ -413,7 +442,7 @@ lsm_write_batch_t *lsm_write_batch_init(void) {
 }
 
 bool lsm_write_batch_put(lsm_write_batch_t *b, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
-    if (klen > MAX_KEY_SIZE) return false; // [Phase 1 Fix] Enforce limits
+    if (klen > MAX_KEY_SIZE) return false;
     if (b->count == b->capacity) {
         b->capacity *= 2;
         b->entries = aml_realloc(b->entries, b->capacity * sizeof(lsm_batch_entry_t));
@@ -430,7 +459,7 @@ bool lsm_write_batch_put(lsm_write_batch_t *b, const void *key, uint32_t klen, c
 }
 
 bool lsm_write_batch_delete(lsm_write_batch_t *b, const void *key, uint32_t klen) {
-    if (klen > MAX_KEY_SIZE) return false; // [Phase 1 Fix] Enforce limits
+    if (klen > MAX_KEY_SIZE) return false;
     if (b->count == b->capacity) {
         b->capacity *= 2;
         b->entries = aml_realloc(b->entries, b->capacity * sizeof(lsm_batch_entry_t));
@@ -458,14 +487,21 @@ void lsm_write_batch_destroy(lsm_write_batch_t *b) {
 bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (!batch || batch->count == 0) return true;
 
+    // [Phase 2 Fix] Reject traffic if closing
+    pthread_mutex_lock(&db->state_mutex);
+    if (db->is_closing) {
+        pthread_mutex_unlock(&db->state_mutex);
+        return false;
+    }
+    pthread_mutex_unlock(&db->state_mutex);
+
     lsm_db_retain(db);
-    pthread_mutex_lock(&db->write_mutex); // [Phase 1 Fix] Sequence alignment requires locking early
+    pthread_mutex_lock(&db->write_mutex);
 
     uint64_t start_seq = db->current_seq + 1;
     db->current_seq += batch->count;
 
     if (db->env->global_wal && db->env->global_wal->append) {
-        // [Phase 1 Fix] Serialize batch into a single logical WAL record to prevent torn writes
         uint32_t blob_size = 4;
         for (size_t i = 0; i < batch->count; i++) {
             blob_size += 1 + 4 + 4 + batch->entries[i].klen + batch->entries[i].vlen;
@@ -488,7 +524,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
             }
         }
 
-        // Use OP_BATCH (2) so recovery knows to decode the framing
         db->env->global_wal->append(db->env->global_wal, db->table_id, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
         aml_free(blob);
     }
@@ -510,7 +545,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     return success;
 }
 
-// Single-op wrappers
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
     if (key_len > MAX_KEY_SIZE) return false;
     lsm_write_batch_t *b = lsm_write_batch_init();
@@ -529,13 +563,19 @@ bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
     return res;
 }
 
-// --- Snapshot Isolated Reads ---
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_seq_num, uint32_t *out_val_len) {
+    // [Phase 2 Fix] Reject traffic if closing
+    pthread_mutex_lock(&db->state_mutex);
+    if (db->is_closing) {
+        pthread_mutex_unlock(&db->state_mutex);
+        return NULL;
+    }
+    pthread_mutex_unlock(&db->state_mutex);
+
     lsm_db_retain(db);
 
     if (key_len > MAX_KEY_SIZE) { lsm_db_release(db); return NULL; }
 
-    // [Phase 1 Fix] Protect out_val_len from blind assignment & prevent leaking on tombstones
     uint32_t local_vlen = 0;
     if (out_val_len) *out_val_len = 0;
 
@@ -659,7 +699,7 @@ cleanup:
     return ret_val;
 }
 
-// --- Iterator Utils & Setup ---
+// ... iter_cmp, iter_push, iter_pop, advance_source remain unchanged ...
 typedef struct {
     const char *key; uint32_t klen;
     const char *val; uint32_t vlen;
@@ -747,6 +787,14 @@ static void advance_source(lsm_db_iter_t *it, iter_node_t *n) {
 }
 
 lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db, uint64_t read_seq_num) {
+    // [Phase 2 Fix] Reject traffic if closing
+    pthread_mutex_lock(&db->state_mutex);
+    if (db->is_closing) {
+        pthread_mutex_unlock(&db->state_mutex);
+        return NULL;
+    }
+    pthread_mutex_unlock(&db->state_mutex);
+
     lsm_db_retain(db);
 
     lsm_db_iter_t *it = aml_zalloc(sizeof(lsm_db_iter_t));
