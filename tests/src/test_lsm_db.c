@@ -54,14 +54,14 @@ MACRO_TEST(db_basic_put_get_delete) {
     MACRO_ASSERT_TRUE(lsm_db_put(db, "usr_2", 5, "data_B", 6));
 
     uint32_t vlen;
-    char *v1 = lsm_db_get(db, "usr_1", 5, &vlen);
+    char *v1 = lsm_db_get(db, "usr_1", 5, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v1 != NULL);
     MACRO_ASSERT_TRUE(memcmp(v1, "data_A", 6) == 0);
     free(v1);
 
     // Delete
     MACRO_ASSERT_TRUE(lsm_db_delete(db, "usr_1", 5));
-    char *v1_del = lsm_db_get(db, "usr_1", 5, &vlen);
+    char *v1_del = lsm_db_get(db, "usr_1", 5, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v1_del == NULL);
 
     lsm_db_close(db);
@@ -80,7 +80,7 @@ MACRO_TEST(db_force_flush_and_read_from_sstable) {
     usleep(100 * 1000);
 
     uint32_t vlen;
-    char *v = lsm_db_get(db, "disk_key", 8, &vlen);
+    char *v = lsm_db_get(db, "disk_key", 8, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_TRUE(memcmp(v, "disk_val", 8) == 0);
     free(v);
@@ -103,7 +103,7 @@ MACRO_TEST(db_iterator_merges_memory_and_disk_safely) {
     lsm_db_put(db, "B", 1, "ram_B", 5);
     lsm_db_put(db, "C", 1, "ram_C", 5);
 
-    lsm_db_iter_t *it = lsm_db_iter_init(db);
+    lsm_db_iter_t *it = lsm_db_iter_init(db, UINT64_MAX);
 
     const void *k, *v;
     uint32_t klen, vlen;
@@ -178,44 +178,101 @@ MACRO_TEST(db_l0_cascading_compaction_consolidates_correctly) {
                                   &local_posix_backend, &local_posix_backend, 2, NULL);
     lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
 
-    // 1. Create L0 SSTable File 1: Range ["item_2", "item_4"]
     lsm_db_put(db, "item_2", 6, "old_two", 7);
     lsm_db_put(db, "item_4", 6, "four", 4);
     lsm_db_force_flush(db);
     usleep(100 * 1000);
 
-    // 2. Create L0 SSTable File 2: Range ["item_3", "item_5"] -> Overlaps File 1
     lsm_db_put(db, "item_3", 6, "three", 5);
     lsm_db_put(db, "item_5", 6, "five", 4);
     lsm_db_force_flush(db);
     usleep(100 * 1000);
 
-    // 3. Create L0 SSTable File 3: Range ["item_1", "item_2"] -> Overlaps File 1, chaining them all
-    // Also explicitly shadows "item_2" with a newer value to verify sequence sorting
     lsm_db_put(db, "item_1", 6, "one", 3);
     lsm_db_put(db, "item_2", 6, "new_two", 7);
     lsm_db_force_flush(db);
     usleep(100 * 1000);
 
-    // 4. Force a 4th flush to cross COMPACTION_TRIGGER (4 files in L0)
-    // This systematically triggers lsmc_compact_level for L0.
-    // The fixed cascading L0 lookahead loop must pull in files 1, 2, and 3
-    // together into the same merge sort, consolidating them flawlessly.
     lsm_db_put(db, "item_9", 6, "nine", 4);
     lsm_db_force_flush(db);
-    usleep(200 * 1000); // Wait for background compaction thread to settle
+    usleep(200 * 1000);
 
-    // 5. Query and verify results to prove sequence priority was preserved over range overlaps
     uint32_t vlen;
-    char *v = lsm_db_get(db, "item_2", 6, &vlen);
+    char *v = lsm_db_get(db, "item_2", 6, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_EQ_INT(vlen, 7);
-    MACRO_ASSERT_TRUE(memcmp(v, "new_two", 7) == 0); // Must be the new one, not shadowed old_two
+    MACRO_ASSERT_TRUE(memcmp(v, "new_two", 7) == 0);
     free(v);
 
-    v = lsm_db_get(db, "item_3", 6, &vlen);
+    v = lsm_db_get(db, "item_3", 6, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_TRUE(memcmp(v, "three", 5) == 0);
+    free(v);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(db_snapshots_provide_repeatable_reads) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // Time T1
+    lsm_db_put(db, "bank_balance", 12, "100", 3);
+
+    // Freeze Time T1
+    uint64_t snap = lsm_db_take_snapshot(db);
+
+    // Time T2
+    lsm_db_put(db, "bank_balance", 12, "200", 3);
+    lsm_db_put(db, "new_account", 11, "50", 2);
+
+    uint32_t vlen;
+
+    // Validate Snapshot ignores the future
+    char *v_snap = lsm_db_get(db, "bank_balance", 12, snap, &vlen);
+    MACRO_ASSERT_TRUE(v_snap != NULL);
+    MACRO_ASSERT_TRUE(memcmp(v_snap, "100", 3) == 0);
+    free(v_snap);
+
+    char *v_snap2 = lsm_db_get(db, "new_account", 11, snap, &vlen);
+    MACRO_ASSERT_TRUE(v_snap2 == NULL);
+
+    // Validate normal read sees latest
+    char *v_latest = lsm_db_get(db, "bank_balance", 12, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v_latest != NULL);
+    MACRO_ASSERT_TRUE(memcmp(v_latest, "200", 3) == 0);
+    free(v_latest);
+
+    lsm_db_release_snapshot(db, snap);
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(db_write_batch_applies_atomically) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    lsm_db_put(db, "K1", 2, "V1", 2);
+
+    lsm_write_batch_t *b = lsm_write_batch_init();
+    lsm_write_batch_put(b, "K2", 2, "V2", 2);
+    lsm_write_batch_delete(b, "K1", 2);
+
+    MACRO_ASSERT_TRUE(lsm_db_write(db, b));
+    lsm_write_batch_destroy(b);
+
+    uint32_t vlen;
+    char *v = lsm_db_get(db, "K1", 2, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v == NULL); // Deleted by batch
+
+    v = lsm_db_get(db, "K2", 2, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL); // Inserted by batch
+    MACRO_ASSERT_TRUE(memcmp(v, "V2", 2) == 0);
     free(v);
 
     lsm_db_close(db);
@@ -232,6 +289,8 @@ int main(void) {
     MACRO_ADD(tests, db_wal_checkpoint_triggered_on_flush);
     MACRO_ADD(tests, db_memory_limit_triggers_stall_and_flush);
     MACRO_ADD(tests, db_l0_cascading_compaction_consolidates_correctly);
+    MACRO_ADD(tests, db_snapshots_provide_repeatable_reads);
+    MACRO_ADD(tests, db_write_batch_applies_atomically);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

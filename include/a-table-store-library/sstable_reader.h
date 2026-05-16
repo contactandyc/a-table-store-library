@@ -22,7 +22,7 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
  *  0 = Not Found in this SSTable
  * -1 = Tombstone Found (Key was explicitly deleted)
  */
-int sstable_reader_get(sstable_reader_t *reader, const void *key, uint32_t key_len, void **out_val, uint32_t *out_val_len);
+int sstable_reader_get(sstable_reader_t *reader, const void *key, uint32_t key_len, uint64_t read_seq_num, void **out_val, uint32_t *out_val_len);
 
 void sstable_reader_destroy(sstable_reader_t *reader);
 

@@ -51,7 +51,6 @@ struct sstable_reader_s {
     uint32_t num_index_entries;
 };
 
-// FIX: Added 'end' boundary to prevent buffer overruns on corrupt reads
 static inline uint32_t decode_varint32(const uint8_t **ptr, const uint8_t *end) {
     uint32_t result = 0; int shift = 0;
     while (*ptr < end) {
@@ -142,7 +141,7 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
     return r;
 }
 
-int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, void **out_val, uint32_t *out_val_len) {
+int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, uint64_t read_seq_num, void **out_val, uint32_t *out_val_len) {
     uint32_t u_len = key_len;
     if (u_len > MAX_KEY_SIZE) return 0;
 
@@ -186,7 +185,6 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
 
     uint8_t *disk_buf = (uint8_t *)cached_block;
 
-    // FIX: Using Exact Size from the 9-Byte Trailer
     uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
     uint8_t flag = disk_buf[idx->size - 5];
     uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
@@ -213,7 +211,7 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
 
     uint32_t num_restarts = decode_u32_le(&block[block_size - 4]);
     uint32_t restarts_offset = block_size - 4 - (num_restarts * 4);
-    const uint8_t *end = block + restarts_offset; // Bounds boundary
+    const uint8_t *end = block + restarts_offset;
 
     uint32_t target_restart = 0;
     int r_left = 0, r_right = (int)num_restarts - 1;
@@ -266,17 +264,22 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, v
 
         if (cmp == 0) {
             const uint8_t *t = (const uint8_t *)(current_key + current_user_len);
-            uint8_t op = (uint8_t)(decode_u64_le(t) & 0xFF);
+            uint64_t packed = decode_u64_le(t);
+            uint64_t seq = packed >> 8;
+            uint8_t op = (uint8_t)(packed & 0xFF);
 
-            if (op == 1) {
-                status = -1;
-            } else {
-                *out_val = aml_malloc(vlen);
-                memcpy(*out_val, ptr, vlen);
-                if (out_val_len) *out_val_len = vlen;
-                status = 1;
+            // FIX: Reject versions that were written AFTER our snapshot
+            if (seq <= read_seq_num) {
+                if (op == 1) {
+                    status = -1;
+                } else {
+                    *out_val = aml_malloc(vlen);
+                    memcpy(*out_val, ptr, vlen);
+                    if (out_val_len) *out_val_len = vlen;
+                    status = 1;
+                }
+                break;
             }
-            break;
         } else if (cmp < 0) break;
         ptr += vlen;
     }
@@ -303,7 +306,7 @@ struct sstable_iter_s {
 
     uint8_t *current_block_buf;
     size_t current_block_size;
-    bool owns_block_buf; // FIX: Allows Zero-Copy iteration for uncompressed blocks
+    bool owns_block_buf;
 
     const uint8_t *ptr;
     const uint8_t *end;
@@ -333,13 +336,12 @@ static bool iter_load_next_block(sstable_iter_t *iter) {
     iter->cached_offset = idx->offset;
     uint8_t *disk_buf = (uint8_t *)cached_block;
 
-    // FIX: Using Exact Size from 9-Byte Trailer
     uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
     uint8_t flag = disk_buf[idx->size - 5];
     uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
 
     if (XXH32(disk_buf, idx->size - 9, 0) != file_crc) {
-        return false; // Silently abort iteration on corruption
+        return false;
     }
 
     if (iter->owns_block_buf && iter->current_block_buf) {
@@ -352,7 +354,7 @@ static bool iter_load_next_block(sstable_iter_t *iter) {
         iter->current_block_size = LZ4_decompress_safe((const char*)disk_buf, (char*)iter->current_block_buf, idx->size - 9, uncomp_size);
         iter->owns_block_buf = true;
     } else {
-        iter->current_block_buf = disk_buf; // Points directly to the cached disk memory
+        iter->current_block_buf = disk_buf;
         iter->current_block_size = uncomp_size;
         iter->owns_block_buf = false;
     }

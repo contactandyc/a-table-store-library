@@ -53,14 +53,14 @@ MACRO_TEST(sstable_build_and_read_roundtrip) {
     int status;
 
     // Test hit
-    status = sstable_reader_get(r, "apple", 5, &val, &vlen);
+    status = sstable_reader_get(r, "apple", 5, UINT64_MAX, &val, &vlen);
     MACRO_ASSERT_EQ_INT(status, 1);
     MACRO_ASSERT_EQ_INT(vlen, 3);
     MACRO_ASSERT_TRUE(memcmp(val, "red", 3) == 0);
     free(val);
 
     // Test miss
-    status = sstable_reader_get(r, "banana", 6, &val, &vlen);
+    status = sstable_reader_get(r, "banana", 6, UINT64_MAX, &val, &vlen);
     MACRO_ASSERT_EQ_INT(status, 0); // Bloom filter should outright reject it
 
     sstable_reader_destroy(r);
@@ -85,7 +85,7 @@ MACRO_TEST(sstable_tombstone_parsing_returns_negative_one) {
 
     uint32_t vlen;
     void *val = NULL;
-    int status = sstable_reader_get(r, "ghost", 5, &val, &vlen);
+    int status = sstable_reader_get(r, "ghost", 5, UINT64_MAX, &val, &vlen);
 
     MACRO_ASSERT_EQ_INT(status, -1);
 
@@ -165,12 +165,9 @@ MACRO_TEST(manifest_survives_torn_and_corrupt_writes) {
     FILE *f = fopen(m_path, "ab");
     MACRO_ASSERT_TRUE(f != NULL);
     uint32_t junk = 0xDEADBEEF;
-    fwrite(&junk, 4, 1, f); // Appending an invalid record length size
+    fwrite(&junk, 4, 1, f);
     fclose(f);
 
-    // 3. Re-open the manifest with a fresh structure.
-    // Replay loop must hit the corrupted boundary, gracefully ignore it via checksum/length limits,
-    // and successfully yield the pristine older state instead of overflowing or crashing.
     lsm_manifest_t *m2 = lsmc_manifest_init(env, 1, dir);
     MACRO_ASSERT_TRUE(m2 != NULL);
 
@@ -199,8 +196,6 @@ MACRO_TEST(sstable_dynamic_lz4_buffer_handling) {
     const char *base = "/tmp/sstable_test_04";
     sstable_builder_t *b = sstable_builder_init(base, &local_posix_backend, FILTER_NONE, 100);
 
-    // Create a payload significantly larger than the old hard-coded 128KB scratch limit
-    // to prove that the new exact-size 9-Byte trailer allocation works perfectly.
     size_t huge_size = 200 * 1024;
     char *huge_val = malloc(huge_size);
     memset(huge_val, 'X', huge_size);
@@ -208,7 +203,6 @@ MACRO_TEST(sstable_dynamic_lz4_buffer_handling) {
     char ikey[1024];
     pack_ikey(ikey, "huge_key", 100, OP_PUT);
 
-    // Ensure compression triggers by pushing past normal block limits
     sstable_builder_add(b, ikey, 8 + 8, huge_val, huge_size);
     sstable_builder_finish(b);
 
@@ -217,7 +211,7 @@ MACRO_TEST(sstable_dynamic_lz4_buffer_handling) {
 
     uint32_t vlen;
     void *val;
-    int status = sstable_reader_get(r, "huge_key", 8, &val, &vlen);
+    int status = sstable_reader_get(r, "huge_key", 8, UINT64_MAX, &val, &vlen);
 
     MACRO_ASSERT_EQ_INT(status, 1);
     MACRO_ASSERT_EQ_INT(vlen, huge_size);

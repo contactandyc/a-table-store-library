@@ -15,6 +15,7 @@ static void* posix_open_reader(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
     posix_file_t *f = malloc(sizeof(posix_file_t));
+    if (!f) { close(fd); return NULL; } // FIX: Guard against OS OOM
     f->fd = fd;
     return f;
 }
@@ -23,15 +24,16 @@ static void* posix_open_writer(const char *path) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return NULL;
     posix_file_t *f = malloc(sizeof(posix_file_t));
+    if (!f) { close(fd); return NULL; }
     f->fd = fd;
     return f;
 }
 
-// FIX: New explicit append mode for WAL & Manifest!
 static void* posix_open_appender(const char *path) {
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return NULL;
     posix_file_t *f = malloc(sizeof(posix_file_t));
+    if (!f) { close(fd); return NULL; }
     f->fd = fd;
     return f;
 }

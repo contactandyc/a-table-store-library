@@ -391,7 +391,7 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
     return true;
 }
 
-bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
+bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t oldest_snapshot) {
     if (source_level >= MAX_LEVELS - 1) return false;
 
     lsm_version_t *v = lsmc_version_retain(manifest);
@@ -408,8 +408,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
     size_t num_source_inputs = 0;
     source_inputs[num_source_inputs++] = L_source->files[0];
 
-    // FIX: L0 files can overlap each other. Expanding the compaction boundary
-    // prevents sequence-number inversions and "resurrecting" deleted keys.
     if (source_level == 0) {
         bool expanded;
         do {
@@ -520,7 +518,8 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
             memcpy(last_user_key, top.key, top_user_len);
             last_user_key_len = top_user_len;
 
-            bool drop = (top.op_type == 1 && is_bottom_level);
+            // FIX: Safely drop tombstones ONLY if no active snapshots need them
+            bool drop = (top.op_type == 1 && is_bottom_level && top.seq <= oldest_snapshot);
 
             if (!drop) {
                 if (builder == NULL) {

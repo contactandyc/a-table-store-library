@@ -26,9 +26,9 @@ typedef struct {
     uint64_t file_size;
     uint32_t num_entries;
 
-    char *min_key; // FIX: Dynamic allocation to save memory
+    char *min_key;
     uint32_t min_key_len;
-    char *max_key; // FIX: Dynamic allocation to save memory
+    char *max_key;
     uint32_t max_key_len;
 
     int ref_count;
@@ -67,9 +67,9 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
                        sstable_meta_t **deleted_files, size_t num_deleted,
                        sstable_meta_t **added_files, size_t num_added);
 
-bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level);
+// FIX: Pinned oldest_snapshot added to correctly prune stale tombstone records
+bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t oldest_snapshot);
 
-/* Retrieves the highest seq_num from the on-disk state */
 uint64_t lsmc_get_max_sequence(lsm_manifest_t *manifest);
 
 #endif /* LSM_COMPACTION_H */
