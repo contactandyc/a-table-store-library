@@ -253,6 +253,11 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, u
         uint32_t unshared = decode_varint32(&ptr, end);
         uint32_t vlen = decode_varint32(&ptr, end);
 
+        // [Phase 1 Fix] Protect the scan logic from out of bound reads
+        if (shared + unshared > MAX_INTERNAL_KEY_SIZE || ptr + unshared + vlen > end) {
+            break;
+        }
+
         memcpy(current_key + shared, ptr, unshared); ptr += unshared;
         current_key_len = shared + unshared;
 
@@ -268,7 +273,6 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, u
             uint64_t seq = packed >> 8;
             uint8_t op = (uint8_t)(packed & 0xFF);
 
-            // FIX: Reject versions that were written AFTER our snapshot
             if (seq <= read_seq_num) {
                 if (op == 1) {
                     status = -1;
@@ -383,6 +387,11 @@ bool sstable_iter_next(sstable_iter_t *iter) {
     uint32_t shared = decode_varint32(&iter->ptr, iter->end);
     uint32_t unshared = decode_varint32(&iter->ptr, iter->end);
     uint32_t vlen = decode_varint32(&iter->ptr, iter->end);
+
+    // [Phase 1 Fix] Protect against buffer overruns from torn / corrupt SSTables
+    if (shared + unshared > MAX_INTERNAL_KEY_SIZE || iter->ptr + unshared + vlen > iter->end) {
+        return false;
+    }
 
     memcpy(iter->current_key + shared, iter->ptr, unshared);
     iter->ptr += unshared;

@@ -40,6 +40,10 @@ static inline void unpack_trailer(const char *internal_key, uint32_t internal_le
     *op = (uint8_t)(trailer & 0xFF);
 }
 
+static inline void encode_u32_le_db(uint8_t *dst, uint32_t v) {
+    dst[0] = v & 0xFF; dst[1] = (v >> 8) & 0xFF; dst[2] = (v >> 16) & 0xFF; dst[3] = (v >> 24) & 0xFF;
+}
+
 struct lsm_db_s {
     uint32_t table_id;
     char db_dir[512];
@@ -131,12 +135,17 @@ static void perform_flush_job(void *arg) {
     bool is_first = true;
     memtable_row_t *row = memtable_first(imm);
     char ikey[MAX_INTERNAL_KEY_SIZE];
+    uint64_t block_max_seq = 0; // [Phase 1 Fix] Track sequence bounds
 
     while (row) {
         uint32_t klen, vlen;
         const void *k = memtable_row_get_key(row, &klen);
         const void *v = memtable_row_get_val(row, &vlen);
-        pack_internal_key(ikey, k, klen, memtable_row_get_seq(row), memtable_row_get_op(row));
+
+        uint64_t seq = memtable_row_get_seq(row);
+        if (seq > block_max_seq) block_max_seq = seq;
+
+        pack_internal_key(ikey, k, klen, seq, memtable_row_get_op(row));
         uint32_t iklen = klen + TRAILER_SIZE;
 
         sstable_builder_add(builder, ikey, iklen, v, vlen);
@@ -155,6 +164,7 @@ static void perform_flush_job(void *arg) {
         row = memtable_next(row);
     }
     meta->file_size = sstable_builder_finish(builder);
+    meta->max_seq = block_max_seq;
 
     sstable_meta_t *added[1] = { meta };
     lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1);
@@ -403,6 +413,7 @@ lsm_write_batch_t *lsm_write_batch_init(void) {
 }
 
 bool lsm_write_batch_put(lsm_write_batch_t *b, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
+    if (klen > MAX_KEY_SIZE) return false; // [Phase 1 Fix] Enforce limits
     if (b->count == b->capacity) {
         b->capacity *= 2;
         b->entries = aml_realloc(b->entries, b->capacity * sizeof(lsm_batch_entry_t));
@@ -419,6 +430,7 @@ bool lsm_write_batch_put(lsm_write_batch_t *b, const void *key, uint32_t klen, c
 }
 
 bool lsm_write_batch_delete(lsm_write_batch_t *b, const void *key, uint32_t klen) {
+    if (klen > MAX_KEY_SIZE) return false; // [Phase 1 Fix] Enforce limits
     if (b->count == b->capacity) {
         b->capacity *= 2;
         b->entries = aml_realloc(b->entries, b->capacity * sizeof(lsm_batch_entry_t));
@@ -445,19 +457,41 @@ void lsm_write_batch_destroy(lsm_write_batch_t *b) {
 
 bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (!batch || batch->count == 0) return true;
-    if (db->env->global_wal && db->env->global_wal->append) {
-        for(size_t i=0; i<batch->count; i++) {
-            db->env->global_wal->append(db->env->global_wal, db->table_id, batch->entries[i].type,
-                                        batch->entries[i].key, batch->entries[i].klen,
-                                        batch->entries[i].val, batch->entries[i].vlen);
-        }
-    }
 
     lsm_db_retain(db);
-    pthread_mutex_lock(&db->write_mutex);
+    pthread_mutex_lock(&db->write_mutex); // [Phase 1 Fix] Sequence alignment requires locking early
 
     uint64_t start_seq = db->current_seq + 1;
     db->current_seq += batch->count;
+
+    if (db->env->global_wal && db->env->global_wal->append) {
+        // [Phase 1 Fix] Serialize batch into a single logical WAL record to prevent torn writes
+        uint32_t blob_size = 4;
+        for (size_t i = 0; i < batch->count; i++) {
+            blob_size += 1 + 4 + 4 + batch->entries[i].klen + batch->entries[i].vlen;
+        }
+
+        uint8_t *blob = aml_malloc(blob_size);
+        uint32_t ptr = 0;
+        encode_u32_le_db(blob + ptr, batch->count); ptr += 4;
+
+        for (size_t i = 0; i < batch->count; i++) {
+            blob[ptr++] = batch->entries[i].type;
+            encode_u32_le_db(blob + ptr, batch->entries[i].klen); ptr += 4;
+            encode_u32_le_db(blob + ptr, batch->entries[i].vlen); ptr += 4;
+
+            memcpy(blob + ptr, batch->entries[i].key, batch->entries[i].klen);
+            ptr += batch->entries[i].klen;
+            if (batch->entries[i].vlen > 0) {
+                memcpy(blob + ptr, batch->entries[i].val, batch->entries[i].vlen);
+                ptr += batch->entries[i].vlen;
+            }
+        }
+
+        // Use OP_BATCH (2) so recovery knows to decode the framing
+        db->env->global_wal->append(db->env->global_wal, db->table_id, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
+        aml_free(blob);
+    }
 
     size_t mem_before = memtable_get_memory_usage(db->memtable);
     for(size_t i=0; i<batch->count; i++) {
@@ -500,6 +534,9 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
     lsm_db_retain(db);
 
     if (key_len > MAX_KEY_SIZE) { lsm_db_release(db); return NULL; }
+
+    // [Phase 1 Fix] Protect out_val_len from blind assignment & prevent leaking on tombstones
+    uint32_t local_vlen = 0;
     if (out_val_len) *out_val_len = 0;
 
     pthread_mutex_lock(&db->write_mutex);
@@ -515,20 +552,22 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
     bool is_deleted = false;
     void *ret_val = NULL;
 
-    const void *val = memtable_get(active, key, key_len, read_seq_num, out_val_len, &is_deleted);
+    const void *val = memtable_get(active, key, key_len, read_seq_num, &local_vlen, &is_deleted);
     if (is_deleted) goto cleanup;
     if (val) {
-        ret_val = aml_malloc(*out_val_len);
-        memcpy(ret_val, val, *out_val_len);
+        ret_val = aml_malloc(local_vlen);
+        memcpy(ret_val, val, local_vlen);
+        if (out_val_len) *out_val_len = local_vlen;
         goto cleanup;
     }
 
     if (imm) {
-        val = memtable_get(imm, key, key_len, read_seq_num, out_val_len, &is_deleted);
+        val = memtable_get(imm, key, key_len, read_seq_num, &local_vlen, &is_deleted);
         if (is_deleted) goto cleanup;
         if (val) {
-            ret_val = aml_malloc(*out_val_len);
-            memcpy(ret_val, val, *out_val_len);
+            ret_val = aml_malloc(local_vlen);
+            memcpy(ret_val, val, local_vlen);
+            if (out_val_len) *out_val_len = local_vlen;
             goto cleanup;
         }
     }
@@ -559,10 +598,14 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
                 if (!r) continue;
 
                 void *disk_val = NULL;
-                int status = sstable_reader_get(r, key, key_len, read_seq_num, &disk_val, out_val_len);
+                int status = sstable_reader_get(r, key, key_len, read_seq_num, &disk_val, &local_vlen);
                 sstable_reader_destroy(r);
 
-                if (status == 1) { ret_val = disk_val; goto cleanup; }
+                if (status == 1) {
+                    ret_val = disk_val;
+                    if (out_val_len) *out_val_len = local_vlen;
+                    goto cleanup;
+                }
                 else if (status == -1) goto cleanup;
             }
         } else {
@@ -595,9 +638,13 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
                 sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
                 if (r) {
                     void *disk_val = NULL;
-                    int status = sstable_reader_get(r, key, key_len, read_seq_num, &disk_val, out_val_len);
+                    int status = sstable_reader_get(r, key, key_len, read_seq_num, &disk_val, &local_vlen);
                     sstable_reader_destroy(r);
-                    if (status == 1) { ret_val = disk_val; goto cleanup; }
+                    if (status == 1) {
+                        ret_val = disk_val;
+                        if (out_val_len) *out_val_len = local_vlen;
+                        goto cleanup;
+                    }
                     else if (status == -1) goto cleanup;
                 }
             }

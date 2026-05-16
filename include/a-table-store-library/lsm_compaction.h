@@ -31,6 +31,10 @@ typedef struct {
     char *max_key;
     uint32_t max_key_len;
 
+    // [Phase 1 Fix] Explicitly track the highest sequence number in this SSTable
+    // to prevent sequence re-use/duplication upon database restart.
+    uint64_t max_seq;
+
     int ref_count;
     bool is_obsolete;
 } sstable_meta_t;

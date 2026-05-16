@@ -183,6 +183,7 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
                 meta->file_id = decode_u64_le(buf + ptr); ptr += 8;
                 meta->file_size = decode_u64_le(buf + ptr); ptr += 8;
                 meta->num_entries = decode_u32_le(buf + ptr); ptr += 4;
+                meta->max_seq = decode_u64_le(buf + ptr); ptr += 8; // [Phase 1 Fix] Deserialization
 
                 meta->min_key_len = decode_u32_le(buf + ptr); ptr += 4;
                 meta->min_key = aml_malloc(meta->min_key_len);
@@ -239,11 +240,8 @@ uint64_t lsmc_get_max_sequence(lsm_manifest_t *manifest) {
     lsm_version_t *v = manifest->current_version;
     for (int lvl=0; lvl<MAX_LEVELS; lvl++) {
         for (size_t f=0; f<v->levels[lvl].num_files; f++) {
-            sstable_meta_t *meta = v->levels[lvl].files[f];
-            if (meta->max_key_len >= INTERNAL_KEY_TRAILER_SIZE) {
-                const uint8_t *t = (const uint8_t*)(meta->max_key + (meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE));
-                uint64_t seq = decode_u64_le(t) >> 8;
-                if (seq > max_seq) max_seq = seq;
+            if (v->levels[lvl].files[f]->max_seq > max_seq) {
+                max_seq = v->levels[lvl].files[f]->max_seq;
             }
         }
     }
@@ -303,7 +301,8 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
     if (manifest->manifest_writer) {
         uint32_t record_len = 16 + (num_deleted * 8);
         for (size_t a = 0; a < num_added; a++) {
-            record_len += 8 + 8 + 4 + 4 + added_files[a]->min_key_len + 4 + added_files[a]->max_key_len;
+            // [Phase 1 Fix] Explicitly encode the max_seq (+8 bytes)
+            record_len += 8 + 8 + 4 + 8 + 4 + added_files[a]->min_key_len + 4 + added_files[a]->max_key_len;
         }
 
         uint8_t *buf = aml_malloc(record_len);
@@ -321,6 +320,7 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
             encode_u64_le(buf + ptr, added_files[a]->file_id); ptr += 8;
             encode_u64_le(buf + ptr, added_files[a]->file_size); ptr += 8;
             encode_u32_le(buf + ptr, added_files[a]->num_entries); ptr += 4;
+            encode_u64_le(buf + ptr, added_files[a]->max_seq); ptr += 8; // [Phase 1 Fix]
 
             encode_u32_le(buf + ptr, added_files[a]->min_key_len); ptr += 4;
             memcpy(buf + ptr, added_files[a]->min_key, added_files[a]->min_key_len); ptr += added_files[a]->min_key_len;
@@ -467,7 +467,7 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     for (size_t i = 0; i < num_inputs; i++) {
         lsmc_generate_base_path(filepath, manifest->db_directory, merge_inputs[i]->file_id);
 
-        int file_level = (i == 0) ? source_level : (source_level + 1);
+        int file_level = (i < num_source_inputs) ? source_level : (source_level + 1);
         lsm_storage_backend_t *vfs = manifest->env->router.hot_vfs;
         if (file_level >= manifest->env->router.cold_storage_start_level) {
             vfs = manifest->env->router.cold_vfs;
@@ -509,54 +509,75 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     uint32_t last_user_key_len = 0;
     bool is_bottom_level = (source_level + 1 == MAX_LEVELS - 1);
 
+    // [Phase 1 Fix] MVCC Data drop prevention tracking
+    uint64_t last_kept_seq = UINT64_MAX;
+
     while (heap.size > 0) {
         heap_node_t top = lsmc_heap_pop(&heap);
         uint32_t top_user_len = get_user_key_len(top.key_len);
         bool same_user_key = (last_user_key_len == top_user_len && memcmp(last_user_key, top.key, top_user_len) == 0);
 
+        // [Phase 1 Fix] Deep MVCC Preservation checks
+        bool drop = false;
         if (!same_user_key) {
             memcpy(last_user_key, top.key, top_user_len);
             last_user_key_len = top_user_len;
+            last_kept_seq = top.seq;
 
-            // FIX: Safely drop tombstones ONLY if no active snapshots need them
-            bool drop = (top.op_type == 1 && is_bottom_level && top.seq <= oldest_snapshot);
+            if (top.op_type == 1 && is_bottom_level && top.seq <= oldest_snapshot) {
+                drop = true;
+            }
+        } else {
+            if (last_kept_seq <= oldest_snapshot) {
+                drop = true;
+            } else {
+                last_kept_seq = top.seq;
+                if (top.op_type == 1 && is_bottom_level && top.seq <= oldest_snapshot) {
+                    drop = true;
+                }
+            }
+        }
 
-            if (!drop) {
-                if (builder == NULL) {
-                    lsmc_generate_base_path(filepath, manifest->db_directory, current_out_id);
-                    builder = sstable_builder_init(filepath, target_vfs, FILTER_BLOOM, 20000);
+        if (!drop) {
+            if (builder == NULL) {
+                lsmc_generate_base_path(filepath, manifest->db_directory, current_out_id);
+                builder = sstable_builder_init(filepath, target_vfs, FILTER_BLOOM, 20000);
 
-                    if (num_new_files >= new_files_cap) {
-                        new_files_cap *= 2;
-                        new_files = aml_realloc(new_files, new_files_cap * sizeof(sstable_meta_t*));
-                    }
-
-                    new_files[num_new_files] = aml_zalloc(sizeof(sstable_meta_t));
-                    new_files[num_new_files]->file_id = current_out_id;
-
-                    new_files[num_new_files]->min_key = aml_malloc(top.key_len);
-                    memcpy(new_files[num_new_files]->min_key, top.key, top.key_len);
-                    new_files[num_new_files]->min_key_len = top.key_len;
+                if (num_new_files >= new_files_cap) {
+                    new_files_cap *= 2;
+                    new_files = aml_realloc(new_files, new_files_cap * sizeof(sstable_meta_t*));
                 }
 
-                sstable_builder_add(builder, top.key, top.key_len, top.val, top.val_len);
+                new_files[num_new_files] = aml_zalloc(sizeof(sstable_meta_t));
+                new_files[num_new_files]->file_id = current_out_id;
 
-                if (new_files[num_new_files]->max_key) aml_free(new_files[num_new_files]->max_key);
-                new_files[num_new_files]->max_key = aml_malloc(top.key_len);
-                memcpy(new_files[num_new_files]->max_key, top.key, top.key_len);
-                new_files[num_new_files]->max_key_len = top.key_len;
+                new_files[num_new_files]->min_key = aml_malloc(top.key_len);
+                memcpy(new_files[num_new_files]->min_key, top.key, top.key_len);
+                new_files[num_new_files]->min_key_len = top.key_len;
+            }
 
-                new_files[num_new_files]->num_entries++;
+            // Track highest sequence seen for this block
+            if (top.seq > new_files[num_new_files]->max_seq) {
+                new_files[num_new_files]->max_seq = top.seq;
+            }
 
-                if (sstable_builder_current_size(builder) >= TARGET_FILE_SIZE) {
-                    new_files[num_new_files]->file_size = sstable_builder_finish(builder);
-                    builder = NULL;
-                    num_new_files++;
+            sstable_builder_add(builder, top.key, top.key_len, top.val, top.val_len);
 
-                    pthread_mutex_lock(&manifest->version_mutex);
-                    current_out_id = manifest->next_file_id++;
-                    pthread_mutex_unlock(&manifest->version_mutex);
-                }
+            if (new_files[num_new_files]->max_key) aml_free(new_files[num_new_files]->max_key);
+            new_files[num_new_files]->max_key = aml_malloc(top.key_len);
+            memcpy(new_files[num_new_files]->max_key, top.key, top.key_len);
+            new_files[num_new_files]->max_key_len = top.key_len;
+
+            new_files[num_new_files]->num_entries++;
+
+            if (sstable_builder_current_size(builder) >= TARGET_FILE_SIZE) {
+                new_files[num_new_files]->file_size = sstable_builder_finish(builder);
+                builder = NULL;
+                num_new_files++;
+
+                pthread_mutex_lock(&manifest->version_mutex);
+                current_out_id = manifest->next_file_id++;
+                pthread_mutex_unlock(&manifest->version_mutex);
             }
         }
 
