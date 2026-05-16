@@ -56,8 +56,13 @@ find_package(the_lz4_library CONFIG REQUIRED)
 # ── Main Targets (Compiled Libraries) ─────────────────────────────────────────
 
 add_library(a_table_store_library_debug STATIC
+  src/lsm_arena.c
+  src/lsm_cache.c
   src/lsm_compaction.c
   src/lsm_db.c
+  src/lsm_env.c
+  src/lsm_pool.c
+  src/lsm_storage.c
   src/memtable.c
   src/sstable_builder.c
   src/sstable_reader.c
@@ -92,8 +97,13 @@ install(TARGETS a_table_store_library_debug EXPORT a_table_store_libraryTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 add_library(a_table_store_library_memory STATIC
+  src/lsm_arena.c
+  src/lsm_cache.c
   src/lsm_compaction.c
   src/lsm_db.c
+  src/lsm_env.c
+  src/lsm_pool.c
+  src/lsm_storage.c
   src/memtable.c
   src/sstable_builder.c
   src/sstable_reader.c
@@ -131,8 +141,13 @@ install(TARGETS a_table_store_library_memory EXPORT a_table_store_libraryTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 add_library(a_table_store_library_static STATIC
+  src/lsm_arena.c
+  src/lsm_cache.c
   src/lsm_compaction.c
   src/lsm_db.c
+  src/lsm_env.c
+  src/lsm_pool.c
+  src/lsm_storage.c
   src/memtable.c
   src/sstable_builder.c
   src/sstable_reader.c
@@ -167,8 +182,13 @@ install(TARGETS a_table_store_library_static EXPORT a_table_store_libraryTargets
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 add_library(a_table_store_library_shared SHARED
+  src/lsm_arena.c
+  src/lsm_cache.c
   src/lsm_compaction.c
   src/lsm_db.c
+  src/lsm_env.c
+  src/lsm_pool.c
+  src/lsm_storage.c
   src/memtable.c
   src/sstable_builder.c
   src/sstable_reader.c
@@ -278,7 +298,12 @@ install(FILES
 # Extra project-specific targets
 
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  enable_testing()
+  add_subdirectory("tests")
+endif()
 
 # Dynamically mount all subprojects (apps, examples, tests, etc.)
 # # add_subdirectory(examples/sql-example)
+# # add_subdirectory(tests)
 # 

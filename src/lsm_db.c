@@ -14,10 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
 
-#define COMPACTION_TRIGGER 4 // Safe to set low now that compaction has its own thread!
-
-/* --- MVCC Internal Key Helpers --- */
+#define COMPACTION_TRIGGER 4
 #define TRAILER_SIZE 8
 
 static inline void pack_internal_key(char *dst, const void *user_key, uint32_t ulen, uint64_t seq, uint8_t op) {
@@ -38,324 +37,479 @@ static inline void unpack_trailer(const char *internal_key, uint32_t internal_le
     *op = (uint8_t)(trailer & 0xFF);
 }
 
-/* --------------------------------------------------------------------------
- * Core DB Structures with 3-Thread Concurrency
- * -------------------------------------------------------------------------- */
-
 struct lsm_db_s {
+    uint32_t table_id;
     char db_dir[512];
+    lsm_env_t *env;
+
+    int ref_count;
 
     memtable_t *memtable;
     memtable_t *imm_memtable;
-    size_t memtable_limit;
 
     lsm_manifest_t *manifest;
     uint64_t current_seq;
 
-    // --- Tri-Thread Architecture ---
-    pthread_t flusher_thread;
-    pthread_t compactor_thread;
+    pthread_mutex_t state_mutex;
+    pthread_mutex_t write_mutex;
+    pthread_cond_t stall_cond;
 
-    pthread_mutex_t bg_mutex;
-    pthread_cond_t flush_cond;     // Wakes up Flusher
-    pthread_cond_t imm_cond;       // Wakes up Main thread
-    pthread_cond_t compact_cond;   // Wakes up Compactor
-    bool bg_shutdown;
+    bool is_flushing;
+    bool is_compacting;
 };
 
-/* --------------------------------------------------------------------------
- * Thread 2: The Flusher (Fast I/O)
- * -------------------------------------------------------------------------- */
+static void perform_compaction_job(void *arg);
 
-static void *flush_worker(void *arg) {
+static void perform_flush_job(void *arg) {
     lsm_db_t *db = (lsm_db_t *)arg;
 
-    while (true) {
-        pthread_mutex_lock(&db->bg_mutex);
-        while (!db->imm_memtable && !db->bg_shutdown) {
-            pthread_cond_wait(&db->flush_cond, &db->bg_mutex);
-        }
+    pthread_mutex_lock(&db->state_mutex);
+    memtable_t *imm = db->imm_memtable;
+    pthread_mutex_unlock(&db->state_mutex);
 
-        memtable_t *imm = db->imm_memtable;
-        bool shutdown = db->bg_shutdown;
-        pthread_mutex_unlock(&db->bg_mutex);
+    if (!imm) return;
 
-        if (imm) {
-            // 1. Get new File ID safely
-            pthread_mutex_lock(&db->manifest->version_mutex);
-            uint64_t file_id = db->manifest->next_file_id++;
-            pthread_mutex_unlock(&db->manifest->version_mutex);
+    size_t freed_mem = memtable_get_memory_usage(imm);
 
-            char path[512];
-            sprintf(path, "%s/%06llu.sst", db->db_dir, (unsigned long long)file_id);
+    pthread_mutex_lock(&db->manifest->version_mutex);
+    uint64_t file_id = db->manifest->next_file_id++;
+    pthread_mutex_unlock(&db->manifest->version_mutex);
 
-            sstable_builder_t *builder = sstable_builder_init(path, 10000);
-            sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
-            meta->file_id = file_id;
+    char base_path[512];
+    snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)file_id);
 
-            bool is_first = true;
-            memtable_row_t *row = memtable_first(imm);
-            char ikey[MAX_KEY_SIZE + TRAILER_SIZE];
+    sstable_builder_t *builder = sstable_builder_init(base_path, db->env->router.hot_vfs, FILTER_BLOOM, 10000);
+    sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
+    meta->file_id = file_id;
 
-            while (row) {
-                uint32_t klen, vlen;
-                const void *k = memtable_row_get_key(row, &klen);
-                const void *v = memtable_row_get_val(row, &vlen);
-                pack_internal_key(ikey, k, klen, memtable_row_get_seq(row), memtable_row_get_op(row));
-                uint32_t iklen = klen + TRAILER_SIZE;
+    bool is_first = true;
+    memtable_row_t *row = memtable_first(imm);
+    char ikey[MAX_INTERNAL_KEY_SIZE];
 
-                sstable_builder_add(builder, ikey, iklen, v, vlen);
-                if (is_first) { memcpy(meta->min_key, ikey, iklen); meta->min_key_len = iklen; is_first = false; }
-                memcpy(meta->max_key, ikey, iklen); meta->max_key_len = iklen;
-                meta->num_entries++;
-                row = memtable_next(row);
-            }
-            meta->file_size = sstable_builder_finish(builder);
+    while (row) {
+        uint32_t klen, vlen;
+        const void *k = memtable_row_get_key(row, &klen);
+        const void *v = memtable_row_get_val(row, &vlen);
+        pack_internal_key(ikey, k, klen, memtable_row_get_seq(row), memtable_row_get_op(row));
+        uint32_t iklen = klen + TRAILER_SIZE;
 
-            // 2. Commit the new L0 file to the MVCC Version Set
-            sstable_meta_t *added[1] = { meta };
-            lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1);
-
-            // 3. Clear Immutable MemTable and wake Main Thread
-            pthread_mutex_lock(&db->bg_mutex);
-            memtable_destroy(db->imm_memtable);
-            db->imm_memtable = NULL;
-            pthread_cond_signal(&db->imm_cond);
-
-            // 4. Check if Compactor needs to wake up!
-            lsm_version_t *v = lsmc_version_retain(db->manifest);
-            if (v->levels[0].num_files >= COMPACTION_TRIGGER) {
-                pthread_cond_signal(&db->compact_cond);
-            }
-            lsmc_version_release(db->manifest, v);
-
-            pthread_mutex_unlock(&db->bg_mutex);
-        }
-
-        if (shutdown && !db->imm_memtable) break;
+        sstable_builder_add(builder, ikey, iklen, v, vlen);
+        if (is_first) { memcpy(meta->min_key, ikey, iklen); meta->min_key_len = iklen; is_first = false; }
+        memcpy(meta->max_key, ikey, iklen); meta->max_key_len = iklen;
+        meta->num_entries++;
+        row = memtable_next(row);
     }
-    return NULL;
-}
+    meta->file_size = sstable_builder_finish(builder);
 
-/* --------------------------------------------------------------------------
- * Thread 3: The Compactor (Heavy CPU/IO)
- * -------------------------------------------------------------------------- */
+    sstable_meta_t *added[1] = { meta };
+    lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1);
 
-static void *compactor_worker(void *arg) {
-    lsm_db_t *db = (lsm_db_t *)arg;
+    pthread_mutex_lock(&db->state_mutex);
 
-    while (true) {
-        pthread_mutex_lock(&db->bg_mutex);
-        while (!db->bg_shutdown) {
-            lsm_version_t *v = lsmc_version_retain(db->manifest);
-            bool needs_work = (v->levels[0].num_files >= COMPACTION_TRIGGER);
-            lsmc_version_release(db->manifest, v);
-
-            if (needs_work) break;
-            pthread_cond_wait(&db->compact_cond, &db->bg_mutex);
-        }
-        bool shutdown = db->bg_shutdown;
-        pthread_mutex_unlock(&db->bg_mutex);
-
-        // Run compactions sequentially until the L0 threshold is satisfied
-        while (true) {
-            lsm_version_t *v = lsmc_version_retain(db->manifest);
-            bool keep_going = (v->levels[0].num_files >= COMPACTION_TRIGGER);
-            lsmc_version_release(db->manifest, v);
-
-            if (!keep_going) break;
-            lsmc_compact_level(db->manifest, 0); // Lock-free execution!
-        }
-
-        if (shutdown) break;
-    }
-    return NULL;
-}
-
-/* --------------------------------------------------------------------------
- * Core DB Operations
- * -------------------------------------------------------------------------- */
-
-lsm_db_t *lsm_db_open(const char *db_directory, size_t mem_limit) {
-    lsm_db_t *db = aml_zalloc(sizeof(lsm_db_t));
-    strncpy(db->db_dir, db_directory, sizeof(db->db_dir) - 1);
-    db->memtable_limit = mem_limit;
-    db->memtable = memtable_init(mem_limit, mem_limit);
+    memtable_release(db->imm_memtable);
     db->imm_memtable = NULL;
-    db->manifest = lsmc_manifest_init(db_directory);
-    db->current_seq = 1;
+    db->is_flushing = false;
+    pthread_cond_broadcast(&db->stall_cond);
+    pthread_mutex_unlock(&db->state_mutex);
 
-    pthread_mutex_init(&db->bg_mutex, NULL);
-    pthread_cond_init(&db->flush_cond, NULL);
-    pthread_cond_init(&db->imm_cond, NULL);
-    pthread_cond_init(&db->compact_cond, NULL);
-    db->bg_shutdown = false;
+    atomic_fetch_sub(&db->env->global_mem_usage, freed_mem);
 
-    // Launch the specialized thread pools
-    pthread_create(&db->flusher_thread, NULL, flush_worker, db);
-    pthread_create(&db->compactor_thread, NULL, compactor_worker, db);
+    lsm_version_t *v = lsmc_version_retain(db->manifest);
+    int target_lvl = -1;
+    for (int i = 0; i < MAX_LEVELS - 1; i++) {
+        int limit = (i == 0) ? 4 : (10 * (1 << i));
+        if (v->levels[i].num_files >= (size_t)limit) {
+            target_lvl = i;
+            break;
+        }
+    }
+    lsmc_version_release(db->manifest, v);
 
+    if (target_lvl != -1) {
+        pthread_mutex_lock(&db->state_mutex);
+        if (!db->is_compacting) {
+            db->is_compacting = true;
+            lsm_pool_submit(db->env->bg_pool, perform_compaction_job, db, 1);
+        }
+        pthread_mutex_unlock(&db->state_mutex);
+    }
+}
+
+static void perform_compaction_job(void *arg) {
+    lsm_db_t *db = (lsm_db_t *)arg;
+
+    while (true) {
+        lsm_version_t *v = lsmc_version_retain(db->manifest);
+        int target_lvl = -1;
+        for (int i = 0; i < MAX_LEVELS - 1; i++) {
+            int limit = (i == 0) ? 4 : (10 * (1 << i));
+            if (v->levels[i].num_files >= (size_t)limit) { target_lvl = i; break; }
+        }
+        lsmc_version_release(db->manifest, v);
+
+        if (target_lvl == -1) break;
+        lsmc_compact_level(db->manifest, target_lvl);
+    }
+
+    pthread_mutex_lock(&db->state_mutex);
+    db->is_compacting = false;
+    pthread_cond_broadcast(&db->stall_cond);
+    pthread_mutex_unlock(&db->state_mutex);
+}
+
+lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_directory) {
+    lsm_db_t *db = aml_zalloc(sizeof(lsm_db_t));
+    db->env = env;
+    db->table_id = table_id;
+    strncpy(db->db_dir, db_directory, sizeof(db->db_dir) - 1);
+    db->ref_count = 1;
+
+    db->manifest = lsmc_manifest_init(env, table_id, db_directory);
+
+    uint64_t max_seq = lsmc_get_max_sequence(db->manifest);
+    db->current_seq = max_seq > 0 ? max_seq : 1;
+
+    db->memtable = memtable_init();
+    atomic_fetch_add(&env->global_mem_usage, memtable_get_memory_usage(db->memtable));
+    db->imm_memtable = NULL;
+
+    pthread_mutex_init(&db->state_mutex, NULL);
+    pthread_mutex_init(&db->write_mutex, NULL);
+    pthread_cond_init(&db->stall_cond, NULL);
+    db->is_flushing = false;
+    db->is_compacting = false;
+
+    lsm_env_register_db(env, db);
     return db;
+}
+
+void lsm_db_retain(lsm_db_t *db) {
+    if (db) __atomic_fetch_add(&db->ref_count, 1, __ATOMIC_SEQ_CST);
+}
+
+void lsm_db_release(lsm_db_t *db) {
+    if (!db) return;
+    if (__atomic_sub_fetch(&db->ref_count, 1, __ATOMIC_SEQ_CST) == 0) {
+        aml_free(db);
+    }
 }
 
 void lsm_db_close(lsm_db_t *db) {
     if (!db) return;
+    lsm_env_unregister_db(db->env, db);
 
-    pthread_mutex_lock(&db->bg_mutex);
-
-    // Drain existing work
-    while (db->imm_memtable != NULL) {
-        pthread_cond_wait(&db->imm_cond, &db->bg_mutex);
+    while (__atomic_load_n(&db->ref_count, __ATOMIC_SEQ_CST) > 1) {
+        usleep(1000);
     }
 
-    // Push the active MemTable into the background thread one last time
+    pthread_mutex_lock(&db->write_mutex);
+    pthread_mutex_lock(&db->state_mutex);
+
+    while (db->imm_memtable != NULL || db->is_flushing) {
+        pthread_mutex_unlock(&db->state_mutex);
+        pthread_mutex_unlock(&db->write_mutex);
+
+        pthread_mutex_lock(&db->state_mutex);
+        while (db->imm_memtable != NULL || db->is_flushing) {
+            pthread_cond_wait(&db->stall_cond, &db->state_mutex);
+        }
+        pthread_mutex_unlock(&db->state_mutex);
+
+        pthread_mutex_lock(&db->write_mutex);
+        pthread_mutex_lock(&db->state_mutex);
+    }
+
     if (memtable_first(db->memtable)) {
         db->imm_memtable = db->memtable;
-        db->memtable = memtable_init(db->memtable_limit, db->memtable_limit);
-        pthread_cond_signal(&db->flush_cond);
+        db->memtable = memtable_init();
+        atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
 
-        while (db->imm_memtable != NULL) {
-            pthread_cond_wait(&db->imm_cond, &db->bg_mutex);
+        if (db->env->global_wal && db->env->global_wal->sync) {
+            db->env->global_wal->sync(db->env->global_wal);
         }
+
+        db->is_flushing = true;
+        lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, 2);
     }
 
-    db->bg_shutdown = true;
-    pthread_cond_broadcast(&db->flush_cond);
-    pthread_cond_broadcast(&db->compact_cond);
-    pthread_mutex_unlock(&db->bg_mutex);
+    pthread_mutex_unlock(&db->state_mutex);
+    pthread_mutex_unlock(&db->write_mutex);
 
-    // Wait for both threads to safely exit
-    pthread_join(db->flusher_thread, NULL);
-    pthread_join(db->compactor_thread, NULL);
+    pthread_mutex_lock(&db->state_mutex);
+    while (db->imm_memtable != NULL || db->is_flushing || db->is_compacting) {
+        pthread_cond_wait(&db->stall_cond, &db->state_mutex);
+    }
+    pthread_mutex_unlock(&db->state_mutex);
 
-    memtable_destroy(db->memtable);
+    atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
+    memtable_release(db->memtable);
 
-    // Force release the remaining version set to physically delete files/metadata
     if (db->manifest) {
         lsm_version_t *v = db->manifest->current_version;
         if (v) lsmc_version_release(db->manifest, v);
+
+        if (db->manifest->manifest_writer) {
+            db->env->router.hot_vfs->fsync_file(db->manifest->manifest_writer);
+            db->env->router.hot_vfs->close_writer(db->manifest->manifest_writer);
+        }
 
         pthread_mutex_destroy(&db->manifest->version_mutex);
         aml_free((void *)db->manifest->db_directory);
         aml_free(db->manifest);
     }
 
-    pthread_mutex_destroy(&db->bg_mutex);
-    pthread_cond_destroy(&db->flush_cond);
-    pthread_cond_destroy(&db->imm_cond);
-    pthread_cond_destroy(&db->compact_cond);
+    pthread_mutex_destroy(&db->write_mutex);
+    pthread_mutex_destroy(&db->state_mutex);
+    pthread_cond_destroy(&db->stall_cond);
 
-    aml_free(db);
+    lsm_db_release(db);
+}
+
+uint32_t lsm_db_get_table_id(lsm_db_t *db) {
+    return db ? db->table_id : 0;
+}
+
+bool lsm_db_force_flush(lsm_db_t *db) {
+    pthread_mutex_lock(&db->write_mutex);
+    pthread_mutex_lock(&db->state_mutex);
+
+    if (db->imm_memtable != NULL || memtable_first(db->memtable) == NULL) {
+        pthread_mutex_unlock(&db->state_mutex);
+        pthread_mutex_unlock(&db->write_mutex);
+        return false;
+    }
+
+    db->imm_memtable = db->memtable;
+    db->memtable = memtable_init();
+    atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
+
+    if (db->env->global_wal && db->env->global_wal->sync) {
+        db->env->global_wal->sync(db->env->global_wal);
+    }
+
+    if (!db->is_flushing) {
+        db->is_flushing = true;
+        lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, 2);
+    }
+
+    pthread_mutex_unlock(&db->state_mutex);
+    pthread_mutex_unlock(&db->write_mutex);
+    return true;
+}
+
+size_t lsm_db_get_active_mem_usage(lsm_db_t *db) {
+    pthread_mutex_lock(&db->write_mutex);
+    size_t sz = memtable_get_memory_usage(db->memtable);
+    pthread_mutex_unlock(&db->write_mutex);
+    return sz;
+}
+
+void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
+    pthread_mutex_lock(&db->write_mutex);
+    uint64_t seq = ++db->current_seq;
+
+    size_t mem_before = memtable_get_memory_usage(db->memtable);
+    memtable_put(db->memtable, seq, op, key, klen, val, vlen);
+    size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
+
+    pthread_mutex_unlock(&db->write_mutex);
+    atomic_fetch_add(&db->env->global_mem_usage, diff);
 }
 
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
+    if (key_len > MAX_KEY_SIZE) return false;
+
+    pthread_mutex_lock(&db->write_mutex);
     uint64_t seq = ++db->current_seq;
 
-    if (!memtable_put(db->memtable, seq, OP_PUT, key, key_len, val, val_len)) {
-        pthread_mutex_lock(&db->bg_mutex);
-        while (db->imm_memtable != NULL) {
-            pthread_cond_wait(&db->imm_cond, &db->bg_mutex);
-        }
-
-        db->imm_memtable = db->memtable;
-        db->memtable = memtable_init(db->memtable_limit, db->memtable_limit);
-        pthread_cond_signal(&db->flush_cond);
-        pthread_mutex_unlock(&db->bg_mutex);
-
-        memtable_put(db->memtable, seq, OP_PUT, key, key_len, val, val_len);
+    if (db->env->global_wal && db->env->global_wal->append) {
+        db->env->global_wal->append(db->env->global_wal, db->table_id, OP_PUT, key, key_len, val, val_len);
     }
+
+    size_t mem_before = memtable_get_memory_usage(db->memtable);
+    memtable_put(db->memtable, seq, OP_PUT, key, key_len, val, val_len);
+    size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
+
+    pthread_mutex_unlock(&db->write_mutex);
+
+    size_t current_usage = atomic_fetch_add(&db->env->global_mem_usage, diff) + diff;
+
+    if (current_usage > db->env->global_mem_limit) {
+        lsm_db_force_flush(db);
+    }
+
+    while (atomic_load(&db->env->global_mem_usage) > (size_t)(db->env->global_mem_limit * 1.5)) usleep(1000);
     return true;
 }
 
 bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
+    if (key_len > MAX_KEY_SIZE) return false;
+
+    pthread_mutex_lock(&db->write_mutex);
     uint64_t seq = ++db->current_seq;
 
-    if (!memtable_put(db->memtable, seq, OP_DELETE, key, key_len, NULL, 0)) {
-        pthread_mutex_lock(&db->bg_mutex);
-        while (db->imm_memtable != NULL) {
-            pthread_cond_wait(&db->imm_cond, &db->bg_mutex);
-        }
-        db->imm_memtable = db->memtable;
-        db->memtable = memtable_init(db->memtable_limit, db->memtable_limit);
-        pthread_cond_signal(&db->flush_cond);
-        pthread_mutex_unlock(&db->bg_mutex);
-
-        memtable_put(db->memtable, seq, OP_DELETE, key, key_len, NULL, 0);
+    if (db->env->global_wal && db->env->global_wal->append) {
+        db->env->global_wal->append(db->env->global_wal, db->table_id, OP_DELETE, key, key_len, NULL, 0);
     }
+
+    size_t mem_before = memtable_get_memory_usage(db->memtable);
+    memtable_put(db->memtable, seq, OP_DELETE, key, key_len, NULL, 0);
+    size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
+    pthread_mutex_unlock(&db->write_mutex);
+
+    size_t current_usage = atomic_fetch_add(&db->env->global_mem_usage, diff) + diff;
+
+    if (current_usage > db->env->global_mem_limit) {
+        lsm_db_force_flush(db);
+    }
+
+    while (atomic_load(&db->env->global_mem_usage) > (size_t)(db->env->global_mem_limit * 1.5)) usleep(1000);
     return true;
 }
 
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint32_t *out_val_len) {
-    bool is_deleted = false;
+    if (key_len > MAX_KEY_SIZE) return NULL;
 
-    // 1. Check Active MemTable
-    const void *val = memtable_get(db->memtable, key, key_len, UINT64_MAX, out_val_len, &is_deleted);
-    if (is_deleted) return NULL;
+    if (out_val_len) *out_val_len = 0;
+
+    pthread_mutex_lock(&db->write_mutex);
+    pthread_mutex_lock(&db->state_mutex);
+
+    memtable_t *active = db->memtable;
+    memtable_retain(active);
+    memtable_t *imm = db->imm_memtable;
+    if (imm) memtable_retain(imm);
+
+    lsm_version_t *v = lsmc_version_retain(db->manifest);
+
+    pthread_mutex_unlock(&db->state_mutex);
+    pthread_mutex_unlock(&db->write_mutex);
+
+    bool is_deleted = false;
+    void *ret_val = NULL;
+
+    const void *val = memtable_get(active, key, key_len, UINT64_MAX, out_val_len, &is_deleted);
+    if (is_deleted) goto cleanup;
     if (val) {
-        void *ret = aml_malloc(*out_val_len);
-        memcpy(ret, val, *out_val_len);
-        return ret;
+        ret_val = aml_malloc(*out_val_len);
+        memcpy(ret_val, val, *out_val_len);
+        goto cleanup;
     }
 
-    // 2. Check Immutable MemTable
-    pthread_mutex_lock(&db->bg_mutex);
-    if (db->imm_memtable) {
-        val = memtable_get(db->imm_memtable, key, key_len, UINT64_MAX, out_val_len, &is_deleted);
-        if (is_deleted) { pthread_mutex_unlock(&db->bg_mutex); return NULL; }
+    if (imm) {
+        val = memtable_get(imm, key, key_len, UINT64_MAX, out_val_len, &is_deleted);
+        if (is_deleted) goto cleanup;
         if (val) {
-            void *ret = aml_malloc(*out_val_len);
-            memcpy(ret, val, *out_val_len);
-            pthread_mutex_unlock(&db->bg_mutex);
-            return ret;
+            ret_val = aml_malloc(*out_val_len);
+            memcpy(ret_val, val, *out_val_len);
+            goto cleanup;
         }
     }
-    pthread_mutex_unlock(&db->bg_mutex);
 
-    // 3. Scan SSTables lock-free via Version Pinning
-    lsm_version_t *v = lsmc_version_retain(db->manifest);
-    char path[512];
-
+    char base_path[512];
     for (int lvl = 0; lvl < MAX_LEVELS; lvl++) {
-        for (int f = v->levels[lvl].num_files - 1; f >= 0; f--) {
-            sstable_meta_t *meta = v->levels[lvl].files[f];
+        if (v->levels[lvl].num_files == 0) continue;
 
-            uint32_t umax = get_user_key_len(meta->max_key_len);
-            uint32_t umin = get_user_key_len(meta->min_key_len);
-            if (memcmp(key, meta->min_key, key_len < umin ? key_len : umin) < 0) continue;
-            if (memcmp(key, meta->max_key, key_len < umax ? key_len : umax) > 0) continue;
+        if (lvl == 0) {
+            for (int f = v->levels[lvl].num_files - 1; f >= 0; f--) {
+                sstable_meta_t *meta = v->levels[lvl].files[f];
+                uint32_t umax = meta->max_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
+                uint32_t umin = meta->min_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->min_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
 
-            sprintf(path, "%s/%06llu.sst", db->db_dir, (unsigned long long)meta->file_id);
-            sstable_reader_t *r = sstable_reader_init(path);
-            if (!r) continue;
+                uint32_t min_cmp_len = key_len < umin ? key_len : umin;
+                int cmp_min = memcmp(key, meta->min_key, min_cmp_len);
+                if (cmp_min == 0) cmp_min = (key_len < umin) ? -1 : (key_len > umin ? 1 : 0);
+                if (cmp_min < 0) continue;
 
-            void *disk_val = sstable_reader_get(r, key, key_len, out_val_len);
-            sstable_reader_destroy(r);
+                uint32_t max_cmp_len = key_len < umax ? key_len : umax;
+                int cmp_max = memcmp(key, meta->max_key, max_cmp_len);
+                if (cmp_max == 0) cmp_max = (key_len < umax) ? -1 : (key_len > umax ? 1 : 0);
+                if (cmp_max > 0) continue;
 
-            if (disk_val) {
-                lsmc_version_release(db->manifest, v);
-                return disk_val;
+                snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
+                lsm_storage_backend_t *vfs = db->env->router.hot_vfs;
+                sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
+                if (!r) continue;
+
+                void *disk_val = NULL;
+                int status = sstable_reader_get(r, key, key_len, &disk_val, out_val_len);
+                sstable_reader_destroy(r);
+
+                if (status == 1) {
+                    ret_val = disk_val;
+                    goto cleanup;
+                } else if (status == -1) {
+                    goto cleanup;
+                }
+            }
+        } else {
+            int left = 0, right = v->levels[lvl].num_files - 1, target_idx = -1;
+            while(left <= right) {
+                int mid = left + (right - left)/2;
+                sstable_meta_t *meta = v->levels[lvl].files[mid];
+
+                uint32_t umax = meta->max_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
+                uint32_t umin = meta->min_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->min_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
+
+                uint32_t min_cmp_len = key_len < umin ? key_len : umin;
+                int cmp_min = memcmp(key, meta->min_key, min_cmp_len);
+                if (cmp_min == 0) cmp_min = (key_len < umin) ? -1 : (key_len > umin ? 1 : 0);
+
+                if (cmp_min < 0) {
+                    right = mid - 1;
+                    continue;
+                }
+
+                uint32_t max_cmp_len = key_len < umax ? key_len : umax;
+                int cmp_max = memcmp(key, meta->max_key, max_cmp_len);
+                if (cmp_max == 0) cmp_max = (key_len < umax) ? -1 : (key_len > umax ? 1 : 0);
+
+                if (cmp_max > 0) {
+                    left = mid + 1;
+                    continue;
+                }
+
+                target_idx = mid;
+                break;
+            }
+
+            if (target_idx != -1) {
+                sstable_meta_t *meta = v->levels[lvl].files[target_idx];
+                snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
+                lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
+                sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
+                if (r) {
+                    void *disk_val = NULL;
+                    int status = sstable_reader_get(r, key, key_len, &disk_val, out_val_len);
+                    sstable_reader_destroy(r);
+                    if (status == 1) { ret_val = disk_val; goto cleanup; }
+                    else if (status == -1) goto cleanup;
+                }
             }
         }
     }
-    lsmc_version_release(db->manifest, v);
-    return NULL;
-}
 
-/* --------------------------------------------------------------------------
- * Global Merging Iterator (For SQL Table Scans)
- * -------------------------------------------------------------------------- */
+cleanup:
+    memtable_release(active);
+    if (imm) memtable_release(imm);
+    lsmc_version_release(db->manifest, v);
+
+    return ret_val;
+}
 
 typedef struct {
     const char *key; uint32_t klen;
     const char *val; uint32_t vlen;
     uint64_t seq; uint8_t op;
-    int src_type; // 0 = memtable, 1 = sstable
+    int src_type;
     void *src_ptr;
 } iter_node_t;
 
 struct lsm_db_iter_s {
     lsm_db_t *db;
-    lsm_version_t *version; // Pin the MVCC state!
+    lsm_version_t *version;
+    memtable_t *active;
+    memtable_t *imm;
 
     iter_node_t *heap;
     size_t heap_size;
@@ -363,7 +517,7 @@ struct lsm_db_iter_s {
     sstable_iter_t **iters;
     size_t num_files;
 
-    char last_user_key[MAX_KEY_SIZE];
+    char last_user_key[MAX_INTERNAL_KEY_SIZE];
     uint32_t last_user_key_len;
     bool is_first;
 
@@ -418,7 +572,7 @@ static void advance_source(lsm_db_iter_t *it, iter_node_t *n) {
             n->val = memtable_row_get_val(nxt, &n->vlen);
             n->seq = memtable_row_get_seq(nxt);
             n->op = memtable_row_get_op(nxt);
-            n->klen += TRAILER_SIZE;
+            n->klen += INTERNAL_KEY_TRAILER_SIZE;
             iter_push(it, *n);
         }
     } else {
@@ -432,16 +586,18 @@ static void advance_source(lsm_db_iter_t *it, iter_node_t *n) {
 }
 
 lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db) {
-    // Await flush so the scan sees everything that was just inserted
-    pthread_mutex_lock(&db->bg_mutex);
-    while (db->imm_memtable != NULL) {
-        pthread_cond_wait(&db->imm_cond, &db->bg_mutex);
-    }
-    pthread_mutex_unlock(&db->bg_mutex);
-
     lsm_db_iter_t *it = aml_zalloc(sizeof(lsm_db_iter_t));
     it->db = db;
-    it->version = lsmc_version_retain(db->manifest); // Pin the DB state!
+
+    pthread_mutex_lock(&db->write_mutex);
+    pthread_mutex_lock(&db->state_mutex);
+
+    it->active = db->memtable; memtable_retain(it->active);
+    it->imm = db->imm_memtable; if (it->imm) memtable_retain(it->imm);
+    it->version = lsmc_version_retain(db->manifest);
+
+    pthread_mutex_unlock(&db->state_mutex);
+    pthread_mutex_unlock(&db->write_mutex);
 
     it->is_first = true;
     it->ret_val_cap = 4096;
@@ -450,28 +606,36 @@ lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db) {
     size_t total_files = 0;
     for (int i=0; i<MAX_LEVELS; i++) total_files += it->version->levels[i].num_files;
 
-    it->heap = aml_malloc((1 + total_files) * sizeof(iter_node_t));
+    it->heap = aml_malloc((2 + total_files) * sizeof(iter_node_t));
     it->readers = aml_malloc(total_files * sizeof(sstable_reader_t*));
     it->iters = aml_malloc(total_files * sizeof(sstable_iter_t*));
 
-    /* 1. Add MemTable */
-    memtable_row_t *mrow = memtable_first(db->memtable);
+    memtable_row_t *mrow = memtable_first(it->active);
     if (mrow) {
-        iter_node_t n = {0};
-        n.src_type = 0; n.src_ptr = mrow;
+        iter_node_t n = {0}; n.src_type = 0; n.src_ptr = mrow;
         n.key = memtable_row_get_key(mrow, &n.klen);
         n.val = memtable_row_get_val(mrow, &n.vlen);
         n.seq = memtable_row_get_seq(mrow); n.op = memtable_row_get_op(mrow);
-        n.klen += TRAILER_SIZE;
-        iter_push(it, n);
+        n.klen += INTERNAL_KEY_TRAILER_SIZE; iter_push(it, n);
     }
 
-    /* 2. Add SSTables safely from our Pinned Version */
-    char path[512];
+    if (it->imm) {
+        memtable_row_t *imrow = memtable_first(it->imm);
+        if (imrow) {
+            iter_node_t n = {0}; n.src_type = 0; n.src_ptr = imrow;
+            n.key = memtable_row_get_key(imrow, &n.klen);
+            n.val = memtable_row_get_val(imrow, &n.vlen);
+            n.seq = memtable_row_get_seq(imrow); n.op = memtable_row_get_op(imrow);
+            n.klen += INTERNAL_KEY_TRAILER_SIZE; iter_push(it, n);
+        }
+    }
+
+    char base_path[512];
     for (int lvl=0; lvl<MAX_LEVELS; lvl++) {
         for (size_t f=0; f<it->version->levels[lvl].num_files; f++) {
-            sprintf(path, "%s/%06llu.sst", db->db_dir, (unsigned long long)it->version->levels[lvl].files[f]->file_id);
-            sstable_reader_t *r = sstable_reader_init(path);
+            snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)it->version->levels[lvl].files[f]->file_id);
+            lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
+            sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, it->version->levels[lvl].files[f]->file_id);
 
             if (!r) continue;
 
@@ -489,14 +653,12 @@ lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db) {
             }
         }
     }
-
     return it;
 }
 
 bool lsm_db_iter_next(lsm_db_iter_t *it, const void **key, uint32_t *klen, const void **val, uint32_t *vlen) {
     while (it->heap_size > 0) {
         iter_node_t top = it->heap[0];
-
         uint32_t ulen = get_user_key_len(top.klen);
         bool same_key = false;
 
@@ -518,9 +680,7 @@ bool lsm_db_iter_next(lsm_db_iter_t *it, const void **key, uint32_t *klen, const
                 it->ret_val_cap = ret_vlen * 2 + 1024;
                 it->ret_val_buf = aml_realloc(it->ret_val_buf, it->ret_val_cap);
             }
-            if (ret_vlen > 0) {
-                memcpy(it->ret_val_buf, top.val, ret_vlen);
-            }
+            if (ret_vlen > 0) memcpy(it->ret_val_buf, top.val, ret_vlen);
 
             iter_pop(it);
             advance_source(it, &top);
@@ -544,8 +704,8 @@ void lsm_db_iter_destroy(lsm_db_iter_t *it) {
         sstable_iter_destroy(it->iters[i]);
         sstable_reader_destroy(it->readers[i]);
     }
-
-    // Release the pin! If we were the last reader on an old version, this drops the files!
+    memtable_release(it->active);
+    if (it->imm) memtable_release(it->imm);
     lsmc_version_release(it->db->manifest, it->version);
 
     aml_free(it->ret_val_buf);

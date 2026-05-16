@@ -4,16 +4,12 @@
 // Maintainer: Andy Curtis <contactandyc@gmail.com>
 
 #include "a-table-store-library/memtable.h"
-#include "a-memory-library/aml_pool.h"
+#include "a-table-store-library/lsm_arena.h"
 #include "a-memory-library/aml_alloc.h"
 #include "the-macro-library/macro_skiplist.h"
 #include <string.h>
 
 #define MEMTABLE_MAX_HEIGHT 12
-
-/* --------------------------------------------------------------------------
- * Internal Structures & Pointers
- * -------------------------------------------------------------------------- */
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
@@ -41,13 +37,11 @@ struct memtable_row_index_s {
 #endif
 
 struct memtable_s {
-    aml_pool_t *pool;
+    lsm_arena_t *arena;
     macro_skiplist_t *head;
-    size_t memory_usage;
-    size_t memory_limit;
+    int ref_count;
 };
 
-/* Primary layout: [Pointers] -> [Key] -> [Value] */
 static inline const char* internal_row_key(const memtable_row_t *row) {
     return (const char *)&row->link.forward[row->link.height];
 }
@@ -55,17 +49,12 @@ static inline const char* internal_row_val(const memtable_row_t *row) {
     return internal_row_key(row) + row->key_len;
 }
 
-/* Index layout: [Pointers] -> [SecKey] -> [PriKey] */
 static inline const char* internal_index_sec_key(const memtable_row_index_t *row) {
     return (const char *)&row->link.forward[row->link.height];
 }
 static inline const char* internal_index_pri_key(const memtable_row_index_t *row) {
     return internal_index_sec_key(row) + row->sec_key_len;
 }
-
-/* --------------------------------------------------------------------------
- * Comparators (Primary)
- * -------------------------------------------------------------------------- */
 
 typedef struct {
     const char *key;
@@ -81,7 +70,6 @@ static int memtable_row_cmp(const memtable_row_t *a, const memtable_row_t *b) {
     if (c != 0) return c;
     if (a->key_len != b->key_len) return a->key_len < b->key_len ? -1 : 1;
 
-    /* Sequence Number DESCENDING */
     if (a->seq_num > b->seq_num) return -1;
     if (a->seq_num < b->seq_num) return 1;
     return 0;
@@ -103,11 +91,6 @@ static int memtable_kv_cmp(const memtable_lookup_t *lookup, const memtable_row_t
 macro_multimap_skiplist_insert_with_field(memtable_sl_insert, link, memtable_row_t, memtable_row_cmp)
 macro_skiplist_lower_bound_kv_with_field(memtable_sl_lower_bound, link, memtable_lookup_t, memtable_row_t, memtable_kv_cmp)
 
-
-/* --------------------------------------------------------------------------
- * Comparators (Secondary Index)
- * -------------------------------------------------------------------------- */
-
 typedef struct {
     const char *sec_key;
     uint32_t sec_key_len;
@@ -128,7 +111,6 @@ static int memtable_index_row_cmp(const memtable_row_index_t *a, const memtable_
     if (c != 0) return c;
     if (a->pri_key_len != b->pri_key_len) return a->pri_key_len < b->pri_key_len ? -1 : 1;
 
-    /* Sequence Number DESCENDING */
     if (a->seq_num > b->seq_num) return -1;
     if (a->seq_num < b->seq_num) return 1;
     return 0;
@@ -148,35 +130,39 @@ static int memtable_index_kv_cmp(const index_lookup_t *lookup, const memtable_ro
 macro_multimap_skiplist_insert_with_field(memtable_index_sl_insert, link, memtable_row_index_t, memtable_index_row_cmp)
 macro_skiplist_lower_bound_kv_with_field(memtable_index_sl_lower_bound, link, index_lookup_t, memtable_row_index_t, memtable_index_kv_cmp)
 
-
-/* --------------------------------------------------------------------------
- * Lifecycle API
- * -------------------------------------------------------------------------- */
-
-memtable_t *memtable_init(size_t pool_size, size_t mem_limit) {
+memtable_t *memtable_init(void) {
     memtable_t *mt = (memtable_t *)aml_malloc(sizeof(memtable_t));
     if (!mt) return NULL;
 
-    mt->pool = aml_pool_init(pool_size);
-    mt->memory_usage = 0;
-    mt->memory_limit = mem_limit;
-
+    mt->arena = lsm_arena_init();
     size_t head_size = sizeof(macro_skiplist_t) + (MEMTABLE_MAX_HEIGHT * sizeof(void*));
-    mt->head = (macro_skiplist_t *)aml_pool_alloc(mt->pool, head_size);
+    mt->head = (macro_skiplist_t *)lsm_arena_alloc(mt->arena, head_size);
     macro_skiplist_init_head(mt->head, MEMTABLE_MAX_HEIGHT);
+    mt->ref_count = 1;
 
     return mt;
 }
 
-void memtable_destroy(memtable_t *mt) {
-    if (!mt) return;
-    aml_pool_destroy(mt->pool);
-    aml_free(mt);
+void memtable_retain(memtable_t *mt) {
+    if (mt) __atomic_fetch_add(&mt->ref_count, 1, __ATOMIC_SEQ_CST);
 }
 
-/* --------------------------------------------------------------------------
- * Primary Data Implementations
- * -------------------------------------------------------------------------- */
+void memtable_release(memtable_t *mt) {
+    if (!mt) return;
+    if (__atomic_sub_fetch(&mt->ref_count, 1, __ATOMIC_SEQ_CST) == 0) {
+        lsm_arena_destroy(mt->arena);
+        aml_free(mt);
+    }
+}
+
+void memtable_destroy(memtable_t *mt) {
+    memtable_release(mt);
+}
+
+size_t memtable_get_memory_usage(memtable_t *mt) {
+    if (!mt) return 0;
+    return lsm_arena_used(mt->arena);
+}
 
 bool memtable_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
                   const void *key, uint32_t key_len,
@@ -185,10 +171,7 @@ bool memtable_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
     uint8_t h = macro_skiplist_random_height(MEMTABLE_MAX_HEIGHT);
     size_t row_size = sizeof(memtable_row_t) + (h * sizeof(void*)) + key_len + val_len;
 
-    mt->memory_usage += row_size;
-    if (mt->memory_usage > mt->memory_limit) return false;
-
-    memtable_row_t *row = (memtable_row_t *)aml_pool_alloc(mt->pool, row_size);
+    memtable_row_t *row = (memtable_row_t *)lsm_arena_alloc(mt->arena, row_size);
     row->seq_num = seq_num;
     row->key_len = key_len;
     row->val_len = val_len;
@@ -203,7 +186,6 @@ bool memtable_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
     return memtable_sl_insert(mt->head, row);
 }
 
-// --- FIX 1: Explicit Tombstone Reporting ---
 const void *memtable_get(memtable_t *mt, const void *key, uint32_t key_len,
                          uint64_t read_seq_num, uint32_t *out_len, bool *is_deleted) {
     if (is_deleted) *is_deleted = false;
@@ -214,7 +196,7 @@ const void *memtable_get(memtable_t *mt, const void *key, uint32_t key_len,
     if (!row || row->key_len != key_len || memcmp(internal_row_key(row), key, key_len) != 0) return NULL;
 
     if (row->op_type == OP_DELETE) {
-        if (is_deleted) *is_deleted = true; // Mark as explicitly deleted!
+        if (is_deleted) *is_deleted = true;
         return NULL;
     }
 
@@ -245,10 +227,6 @@ const void *memtable_row_get_val(const memtable_row_t *row, uint32_t *out_len) {
 uint64_t memtable_row_get_seq(const memtable_row_t *row) { return row->seq_num; }
 op_type_t memtable_row_get_op(const memtable_row_t *row) { return row->op_type; }
 
-/* --------------------------------------------------------------------------
- * Secondary Index Implementations
- * -------------------------------------------------------------------------- */
-
 bool memtable_index_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
                         const void *sec_key, uint32_t sec_key_len,
                         const void *pri_key, uint32_t pri_key_len) {
@@ -256,10 +234,7 @@ bool memtable_index_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
     uint8_t h = macro_skiplist_random_height(MEMTABLE_MAX_HEIGHT);
     size_t row_size = sizeof(memtable_row_index_t) + (h * sizeof(void*)) + sec_key_len + pri_key_len;
 
-    mt->memory_usage += row_size;
-    if (mt->memory_usage > mt->memory_limit) return false;
-
-    memtable_row_index_t *row = (memtable_row_index_t *)aml_pool_alloc(mt->pool, row_size);
+    memtable_row_index_t *row = (memtable_row_index_t *)lsm_arena_alloc(mt->arena, row_size);
     row->seq_num = seq_num;
     row->sec_key_len = sec_key_len;
     row->pri_key_len = pri_key_len;

@@ -9,30 +9,25 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "a-table-store-library/lsm_storage.h"
 
 typedef struct sstable_builder_s sstable_builder_t;
 
-/*
- * Initialize a new SSTable builder and open the file for writing.
- * expected_elements is required to optimally size the internal Bloom filter.
- */
-sstable_builder_t *sstable_builder_init(const char *filepath, size_t expected_elements);
+#define FILTER_NONE   0
+#define FILTER_BLOOM  1
+#define FILTER_BITMAP 2
 
 /*
- * Add a record to the SSTable.
- * MUST be called in strictly ascending sorted order!
+ * Initialize a new SSTable builder.
+ * Passes the VFS backend and base_path (e.g., "/db/00001" without extensions).
  */
-bool sstable_builder_add(sstable_builder_t *builder,
-                         const void *key, uint32_t key_len,
-                         const void *val, uint32_t val_len);
+sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backend_t *backend, int filter_type, size_t expected_elements);
 
-// Add this new function to track the 2MB split limit
+bool sstable_builder_add(sstable_builder_t *builder, const void *key, uint32_t key_len, const void *val, uint32_t val_len);
+
 uint64_t sstable_builder_current_size(sstable_builder_t *builder);
 
-/* Returns the final file size in bytes, or 0 on failure.
-  * Seal the final blocks, flush the I/O buffer to disk,
-  * write the Index and Bloom filters, and close the file.
- */
+/* Writes the massive .data file and the merged .meta file */
 uint64_t sstable_builder_finish(sstable_builder_t *builder);
 
 #endif /* SSTABLE_BUILDER_H */

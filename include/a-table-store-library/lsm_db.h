@@ -9,24 +9,27 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "a-table-store-library/lsm_env.h"
 
 typedef struct lsm_db_s lsm_db_t;
 typedef struct lsm_db_iter_s lsm_db_iter_t;
 
-/* Open the database, specifying a MemTable size limit (e.g., 64MB) */
-lsm_db_t *lsm_db_open(const char *db_directory, size_t mem_limit);
+lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_directory);
 
-/* Close the database and flush pending memory to disk */
+void lsm_db_retain(lsm_db_t *db);
+void lsm_db_release(lsm_db_t *db);
 void lsm_db_close(lsm_db_t *db);
 
-/* --- CRUD Operations --- */
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len);
 bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len);
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint32_t *out_val_len);
 
-/* --- Streaming Iterator (Required for SQL Table Scans) --- */
 lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db);
 bool lsm_db_iter_next(lsm_db_iter_t *iter, const void **key, uint32_t *klen, const void **val, uint32_t *vlen);
 void lsm_db_iter_destroy(lsm_db_iter_t *iter);
+
+uint32_t lsm_db_get_table_id(lsm_db_t *db);
+size_t lsm_db_get_active_mem_usage(lsm_db_t *db);
+bool lsm_db_force_flush(lsm_db_t *db);
 
 #endif /* LSM_DB_H */

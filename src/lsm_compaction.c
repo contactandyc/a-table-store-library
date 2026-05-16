@@ -8,14 +8,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-
-extern uint64_t sstable_builder_current_size(sstable_builder_t *b);
-
-#define INTERNAL_KEY_TRAILER_SIZE 8
 
 static inline uint32_t get_user_key_len(uint32_t internal_key_len) {
     return internal_key_len > INTERNAL_KEY_TRAILER_SIZE ? internal_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
+}
+
+static void lsmc_generate_base_path(char *buf, const char *dir, uint64_t file_id) {
+    snprintf(buf, 512, "%s/%06llu", dir, (unsigned long long)file_id);
 }
 
 static int lsmc_meta_cmp(const void *a, const void *b) {
@@ -47,11 +46,6 @@ static bool lsmc_check_overlap(sstable_meta_t *a, sstable_meta_t *b) {
     return true;
 }
 
-static void lsmc_generate_filepath(char *buf, const char *dir, uint64_t file_id) {
-    sprintf(buf, "%s/%06llu.sst", dir, (unsigned long long)file_id);
-}
-
-// --- N-Way Merge Heap ---
 typedef struct {
     const char *key;  uint32_t key_len;
     const char *val;  uint32_t val_len;
@@ -103,13 +97,70 @@ static heap_node_t lsmc_heap_pop(min_heap_t *h) {
     return root;
 }
 
-/* --------------------------------------------------------------------------
- * MVCC & Version Control
- * -------------------------------------------------------------------------- */
+static void replay_manifest(lsm_manifest_t *m, const char *path) {
+    void *reader = m->env->router.hot_vfs->open_reader(path);
+    if (!reader) return;
 
-lsm_manifest_t *lsmc_manifest_init(const char *db_directory) {
+    uint64_t offset = 0;
+    uint32_t header[4];
+
+    while (m->env->router.hot_vfs->pread(reader, header, 16, offset) == 16) {
+        offset += 16;
+        int src_lvl = header[0];
+        int tgt_lvl = header[1];
+        uint32_t num_del = header[2];
+        uint32_t num_add = header[3];
+
+        sstable_meta_t **d_files = NULL;
+        if (num_del > 0) {
+            d_files = aml_malloc(num_del * sizeof(sstable_meta_t*));
+            uint64_t *d_ids = aml_malloc(num_del * 8);
+            m->env->router.hot_vfs->pread(reader, d_ids, num_del * 8, offset);
+            offset += (num_del * 8);
+
+            lsm_version_t *curr = m->current_version;
+            for (uint32_t d = 0; d < num_del; d++) {
+                d_files[d] = NULL;
+                for (int lvl=0; lvl<MAX_LEVELS; lvl++) {
+                    for (size_t f=0; f<curr->levels[lvl].num_files; f++) {
+                        if (curr->levels[lvl].files[f]->file_id == d_ids[d]) {
+                            d_files[d] = curr->levels[lvl].files[f];
+                            break;
+                        }
+                    }
+                }
+            }
+            aml_free(d_ids);
+        }
+
+        sstable_meta_t **a_files = NULL;
+        if (num_add > 0) {
+            a_files = aml_malloc(num_add * sizeof(sstable_meta_t*));
+            for (uint32_t a = 0; a < num_add; a++) {
+                a_files[a] = aml_zalloc(sizeof(sstable_meta_t));
+                m->env->router.hot_vfs->pread(reader, a_files[a], sizeof(sstable_meta_t), offset);
+                offset += sizeof(sstable_meta_t);
+
+                a_files[a]->ref_count = 0;
+                a_files[a]->is_obsolete = false;
+                if (a_files[a]->file_id >= m->next_file_id) {
+                    m->next_file_id = a_files[a]->file_id + 1;
+                }
+            }
+        }
+
+        lsmc_version_edit(m, src_lvl, tgt_lvl, d_files, num_del, a_files, num_add);
+        if (d_files) aml_free(d_files);
+        if (a_files) aml_free(a_files);
+    }
+    m->env->router.hot_vfs->close_reader(reader);
+}
+
+lsm_manifest_t *lsmc_manifest_init(lsm_env_t *env, uint32_t table_id, const char *db_directory) {
     lsm_manifest_t *m = aml_zalloc(sizeof(lsm_manifest_t));
     m->db_directory = aml_strdup(db_directory);
+    m->env = env;
+    m->table_id = table_id;
     m->next_file_id = 1;
     pthread_mutex_init(&m->version_mutex, NULL);
 
@@ -121,7 +172,35 @@ lsm_manifest_t *lsmc_manifest_init(const char *db_directory) {
         v0->levels[i].files = aml_malloc(16 * sizeof(sstable_meta_t*));
     }
     m->current_version = v0;
+
+    char m_path[520];
+    snprintf(m_path, sizeof(m_path), "%s/CURRENT.manifest", db_directory);
+
+    replay_manifest(m, m_path);
+
+    // FIX: Must open the manifest in Appender Mode to prevent O_TRUNC from wiping recovery
+    m->manifest_writer = m->env->router.hot_vfs->open_appender(m_path);
+
     return m;
+}
+
+uint64_t lsmc_get_max_sequence(lsm_manifest_t *manifest) {
+    uint64_t max_seq = 0;
+    pthread_mutex_lock(&manifest->version_mutex);
+    lsm_version_t *v = manifest->current_version;
+    for (int lvl=0; lvl<MAX_LEVELS; lvl++) {
+        for (size_t f=0; f<v->levels[lvl].num_files; f++) {
+            sstable_meta_t *meta = v->levels[lvl].files[f];
+            if (meta->max_key_len >= INTERNAL_KEY_TRAILER_SIZE) {
+                uint64_t trailer;
+                memcpy(&trailer, meta->max_key + (meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE), 8);
+                uint64_t seq = trailer >> 8;
+                if (seq > max_seq) max_seq = seq;
+            }
+        }
+    }
+    pthread_mutex_unlock(&manifest->version_mutex);
+    return max_seq;
 }
 
 lsm_version_t *lsmc_version_retain(lsm_manifest_t *manifest) {
@@ -136,18 +215,28 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
     pthread_mutex_lock(&manifest->version_mutex);
     v->ref_count--;
 
-    // GARBAGE COLLECTION: If no queries are reading this version, destroy it!
     if (v->ref_count == 0) {
         for (int i = 0; i < MAX_LEVELS; i++) {
+            lsm_storage_backend_t *vfs = manifest->env->router.hot_vfs;
+            if (i >= manifest->env->router.cold_storage_start_level) {
+                vfs = manifest->env->router.cold_vfs;
+            }
+
             for (size_t f = 0; f < v->levels[i].num_files; f++) {
                 sstable_meta_t *meta = v->levels[i].files[f];
                 meta->ref_count--;
 
-                // If no versions reference this file, physically delete it from disk!
                 if (meta->ref_count == 0) {
-                    char path[512];
-                    lsmc_generate_filepath(path, manifest->db_directory, meta->file_id);
-                    unlink(path);
+                    if (meta->is_obsolete) {
+                        char base_path[512];
+                        lsmc_generate_base_path(base_path, manifest->db_directory, meta->file_id);
+
+                        char data_path[520]; snprintf(data_path, sizeof(data_path), "%s.data", base_path);
+                        char meta_path[520]; snprintf(meta_path, sizeof(meta_path), "%s.meta", base_path);
+
+                        vfs->delete_file(data_path);
+                        vfs->delete_file(meta_path);
+                    }
                     aml_free(meta);
                 }
             }
@@ -161,15 +250,24 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
 bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_level,
                        sstable_meta_t **deleted_files, size_t num_deleted,
                        sstable_meta_t **added_files, size_t num_added) {
-
-    // (In a real DB, you'd append this edit to the MANIFEST file on disk here)
-
     pthread_mutex_lock(&manifest->version_mutex);
 
-    // Create the new snapshot
+    if (manifest->manifest_writer) {
+        uint32_t header[4] = { source_level, target_level, num_deleted, num_added };
+        manifest->env->router.hot_vfs->append(manifest->manifest_writer, header, 16);
+
+        for (size_t d=0; d<num_deleted; d++) {
+            manifest->env->router.hot_vfs->append(manifest->manifest_writer, &deleted_files[d]->file_id, 8);
+        }
+        for (size_t a=0; a<num_added; a++) {
+            manifest->env->router.hot_vfs->append(manifest->manifest_writer, added_files[a], sizeof(sstable_meta_t));
+        }
+        // FIX: Ensure edit hits disk before reporting success
+        manifest->env->router.hot_vfs->fsync_file(manifest->manifest_writer);
+    }
+
     lsm_version_t *v = aml_zalloc(sizeof(lsm_version_t));
     v->ref_count = 1;
-
     lsm_version_t *curr = manifest->current_version;
 
     for (int i = 0; i < MAX_LEVELS; i++) {
@@ -178,15 +276,16 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
         v->levels[i].files_capacity = cap < 16 ? 16 : cap;
         v->levels[i].files = aml_malloc(v->levels[i].files_capacity * sizeof(sstable_meta_t*));
 
-        // Copy files from previous version
         for (size_t f = 0; f < curr->levels[i].num_files; f++) {
             sstable_meta_t *meta = curr->levels[i].files[f];
-
-            // Skip files that were compacted/deleted!
             bool is_deleted = false;
             if (i == source_level || i == target_level) {
                 for (size_t d = 0; d < num_deleted; d++) {
-                    if (deleted_files[d]->file_id == meta->file_id) { is_deleted = true; break; }
+                    if (deleted_files[d] && deleted_files[d]->file_id == meta->file_id) {
+                        is_deleted = true;
+                        deleted_files[d]->is_obsolete = true;
+                        break;
+                    }
                 }
             }
             if (!is_deleted) {
@@ -195,39 +294,30 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
             }
         }
 
-        // Apply new additions
         if (i == target_level) {
             for (size_t a = 0; a < num_added; a++) {
                 sstable_meta_t *meta = added_files[a];
                 meta->ref_count = 1;
+                meta->is_obsolete = false;
                 v->levels[i].files[v->levels[i].num_files++] = meta;
             }
-            // Sort L1-L6 by key
             if (i > 0) {
                 qsort(v->levels[i].files, v->levels[i].num_files, sizeof(sstable_meta_t*), lsmc_meta_cmp);
             }
         }
     }
 
-    // Atomic Swap
     lsm_version_t *old_version = manifest->current_version;
     manifest->current_version = v;
-
     pthread_mutex_unlock(&manifest->version_mutex);
 
-    // Release the system's hold on the old version
     lsmc_version_release(manifest, old_version);
     return true;
 }
 
-/* --------------------------------------------------------------------------
- * The Compactor
- * -------------------------------------------------------------------------- */
-
 bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
     if (source_level >= MAX_LEVELS - 1) return false;
 
-    // 1. PIN the state! We can read these files safely without locking!
     lsm_version_t *v = lsmc_version_retain(manifest);
 
     lsm_level_t *L_source = &v->levels[source_level];
@@ -256,8 +346,15 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
     min_heap_t heap = { .data = aml_malloc(num_inputs * sizeof(heap_node_t)), .size = 0, .capacity = num_inputs };
 
     for (size_t i = 0; i < num_inputs; i++) {
-        lsmc_generate_filepath(filepath, manifest->db_directory, merge_inputs[i]->file_id);
-        readers[i] = sstable_reader_init(filepath);
+        lsmc_generate_base_path(filepath, manifest->db_directory, merge_inputs[i]->file_id);
+
+        int file_level = (i == 0) ? source_level : (source_level + 1);
+        lsm_storage_backend_t *vfs = manifest->env->router.hot_vfs;
+        if (file_level >= manifest->env->router.cold_storage_start_level) {
+            vfs = manifest->env->router.cold_vfs;
+        }
+
+        readers[i] = sstable_reader_init(filepath, vfs, manifest->env, manifest->table_id, merge_inputs[i]->file_id);
         if (!readers[i]) {
             for (size_t j = 0; j < i; j++) { sstable_iter_destroy(iters[j]); sstable_reader_destroy(readers[j]); }
             aml_free(merge_inputs); aml_free(readers); aml_free(iters); aml_free(heap.data);
@@ -275,17 +372,21 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
         }
     }
 
-    /* 3. Execute N-Way Merge to New Files */
-    sstable_meta_t **new_files = aml_malloc(1024 * sizeof(sstable_meta_t*));
+    size_t new_files_cap = 1024;
+    sstable_meta_t **new_files = aml_malloc(new_files_cap * sizeof(sstable_meta_t*));
     size_t num_new_files = 0;
     sstable_builder_t *builder = NULL;
 
-    // Atomically grab new file IDs
+    lsm_storage_backend_t *target_vfs = manifest->env->router.hot_vfs;
+    if (source_level + 1 >= manifest->env->router.cold_storage_start_level) {
+        target_vfs = manifest->env->router.cold_vfs;
+    }
+
     pthread_mutex_lock(&manifest->version_mutex);
     uint64_t current_out_id = manifest->next_file_id++;
     pthread_mutex_unlock(&manifest->version_mutex);
 
-    char last_user_key[MAX_KEY_SIZE];
+    char last_user_key[MAX_INTERNAL_KEY_SIZE];
     uint32_t last_user_key_len = 0;
     bool is_bottom_level = (source_level + 1 == MAX_LEVELS - 1);
 
@@ -295,12 +396,21 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
         bool same_user_key = (last_user_key_len == top_user_len && memcmp(last_user_key, top.key, top_user_len) == 0);
 
         if (!same_user_key) {
+            memcpy(last_user_key, top.key, top_user_len);
+            last_user_key_len = top_user_len;
+
             bool drop = (top.op_type == 1 && is_bottom_level);
 
             if (!drop) {
                 if (builder == NULL) {
-                    lsmc_generate_filepath(filepath, manifest->db_directory, current_out_id);
-                    builder = sstable_builder_init(filepath, 20000);
+                    lsmc_generate_base_path(filepath, manifest->db_directory, current_out_id);
+                    builder = sstable_builder_init(filepath, target_vfs, FILTER_BLOOM, 20000);
+
+                    if (num_new_files >= new_files_cap) {
+                        new_files_cap *= 2;
+                        new_files = aml_realloc(new_files, new_files_cap * sizeof(sstable_meta_t*));
+                    }
+
                     new_files[num_new_files] = aml_zalloc(sizeof(sstable_meta_t));
                     new_files[num_new_files]->file_id = current_out_id;
                     memcpy(new_files[num_new_files]->min_key, top.key, top.key_len);
@@ -311,9 +421,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
                 memcpy(new_files[num_new_files]->max_key, top.key, top.key_len);
                 new_files[num_new_files]->max_key_len = top.key_len;
                 new_files[num_new_files]->num_entries++;
-
-                memcpy(last_user_key, top.key, top_user_len);
-                last_user_key_len = top_user_len;
 
                 if (sstable_builder_current_size(builder) >= TARGET_FILE_SIZE) {
                     new_files[num_new_files]->file_size = sstable_builder_finish(builder);
@@ -347,10 +454,7 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level) {
         sstable_reader_destroy(readers[i]);
     }
 
-    // 4. ATOMIC SWAP: Publish the new state to the database!
     lsmc_version_edit(manifest, source_level, source_level + 1, merge_inputs, num_inputs, new_files, num_new_files);
-
-    // 5. Unpin our old snapshot. If nobody else is reading those old files, they will be deleted instantly!
     lsmc_version_release(manifest, v);
 
     aml_free(merge_inputs); aml_free(readers); aml_free(iters); aml_free(heap.data); aml_free(new_files);

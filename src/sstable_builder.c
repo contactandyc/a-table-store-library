@@ -14,28 +14,30 @@
 #include "a-memory-library/aml_alloc.h"
 
 #define TARGET_BLOCK_SIZE 16384
-#define IO_BUFFER_SIZE    1048576
 #define RESTART_INTERVAL  16
 #define COMPRESS_NONE     0
 #define COMPRESS_LZ4      1
-#define BLOOM_FP_RATE     0.01
-#define SSTABLE_MAGIC     0x424C4F434B4C534DULL // "BLOCKLSM"
+
+#define MAX_KEY_SIZE 1024
+#define INTERNAL_KEY_TRAILER_SIZE 8
+#define MAX_INTERNAL_KEY_SIZE (MAX_KEY_SIZE + INTERNAL_KEY_TRAILER_SIZE)
 
 struct sstable_builder_s {
-    FILE *file;
+    lsm_storage_backend_t *backend;
+    void *data_writer;
+    char base_path[512];
+
     uint64_t current_file_offset;
 
     uint8_t *block_buf;
     size_t block_pos;
     size_t block_capacity;
 
-    uint8_t *io_buf;
-    size_t io_pos;
-
     uint8_t *lz4_scratch;
     size_t lz4_scratch_cap;
 
-    char last_key[1024];
+    // FIX: Using explicitly sized Internal Key Array!
+    char last_key[MAX_INTERNAL_KEY_SIZE];
     uint32_t last_key_len;
     uint32_t entry_count;
 
@@ -43,13 +45,15 @@ struct sstable_builder_s {
     size_t num_restarts;
     size_t restarts_cap;
 
+    int filter_type;
     bloom_t *bloom;
+    uint8_t *bitmap;
+    size_t bitmap_cap;
+    uint64_t min_bitmap_id;
 
-    /* Index Block Buffer */
     uint8_t *index_buf;
     size_t index_pos;
     size_t index_cap;
-    uint32_t num_index_entries;
 };
 
 static inline int encode_varint32(uint8_t *dst, uint32_t value) {
@@ -62,30 +66,37 @@ static inline int encode_varint32(uint8_t *dst, uint32_t value) {
     return bytes;
 }
 
-sstable_builder_t *sstable_builder_init(const char *filepath, size_t expected_elements) {
-    sstable_builder_t *b = (sstable_builder_t *)aml_zalloc( sizeof(sstable_builder_t));
+sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backend_t *backend, int filter_type, size_t expected_elements) {
+    sstable_builder_t *b = aml_zalloc(sizeof(sstable_builder_t));
+    b->backend = backend;
+    b->filter_type = filter_type;
+    strncpy(b->base_path, base_path, 511);
 
-    b->file = fopen(filepath, "wb");
-    if (!b->file) { aml_free(b); return NULL; }
-    setvbuf(b->file, NULL, _IONBF, 0);
+    char data_path[520];
+    snprintf(data_path, sizeof(data_path), "%s.data", base_path);
+    b->data_writer = backend->open_writer(data_path);
+    if (!b->data_writer) { aml_free(b); return NULL; }
 
     b->block_capacity = TARGET_BLOCK_SIZE + 4096;
-    b->block_buf = (uint8_t *)aml_malloc(b->block_capacity);
-
-    b->io_buf = (uint8_t *)aml_malloc(IO_BUFFER_SIZE);
-
-    b->lz4_scratch_cap = (size_t)LZ4_compressBound((int)b->block_capacity);
-    b->lz4_scratch = (uint8_t *)aml_malloc(b->lz4_scratch_cap);
+    b->block_buf = aml_malloc(b->block_capacity);
+    b->lz4_scratch_cap = LZ4_compressBound(b->block_capacity);
+    b->lz4_scratch = aml_malloc(b->lz4_scratch_cap);
 
     b->restarts_cap = 256;
-    b->restarts = (uint32_t *)aml_malloc(b->restarts_cap * sizeof(uint32_t));
+    b->restarts = aml_malloc(b->restarts_cap * sizeof(uint32_t));
     b->restarts[0] = 0;
     b->num_restarts = 1;
 
-    b->index_cap = 65536; // 64KB initial index
-    b->index_buf = (uint8_t *)aml_malloc(b->index_cap);
+    b->index_cap = 65536;
+    b->index_buf = aml_malloc(b->index_cap);
 
-    b->bloom = bloom_init(expected_elements, BLOOM_FP_RATE);
+    if (filter_type == FILTER_BLOOM) {
+        b->bloom = bloom_init(expected_elements, 0.01);
+    } else if (filter_type == FILTER_BITMAP) {
+        b->bitmap_cap = 1024;
+        b->bitmap = aml_zalloc(b->bitmap_cap);
+    }
+
     return b;
 }
 
@@ -93,51 +104,41 @@ static void flush_data_block(sstable_builder_t *b) {
     if (b->block_pos == 0) return;
 
     for (size_t i = 0; i < b->num_restarts; i++) {
-        memcpy(&b->block_buf[b->block_pos], &b->restarts[i], sizeof(uint32_t));
-        b->block_pos += sizeof(uint32_t);
+        memcpy(&b->block_buf[b->block_pos], &b->restarts[i], 4);
+        b->block_pos += 4;
     }
-    uint32_t nr = (uint32_t)b->num_restarts;
-    memcpy(&b->block_buf[b->block_pos], &nr, sizeof(uint32_t));
-    b->block_pos += sizeof(uint32_t);
+    uint32_t nr = b->num_restarts;
+    memcpy(&b->block_buf[b->block_pos], &nr, 4);
+    b->block_pos += 4;
 
     uint8_t compression_flag = COMPRESS_NONE;
     uint8_t *final_buf = b->block_buf;
     size_t final_size = b->block_pos;
 
-    int comp_size = LZ4_compress_default((const char *)b->block_buf, (char *)b->lz4_scratch,
-                                         (int)b->block_pos, (int)b->lz4_scratch_cap);
-
+    int comp_size = LZ4_compress_default((const char *)b->block_buf, (char *)b->lz4_scratch, b->block_pos, b->lz4_scratch_cap);
     if (comp_size > 0 && comp_size < (int)(b->block_pos * 0.88)) {
         final_buf = b->lz4_scratch;
-        final_size = (size_t)comp_size;
+        final_size = comp_size;
         compression_flag = COMPRESS_LZ4;
     }
 
     uint32_t checksum = XXH32(final_buf, final_size, 0);
 
-    /* Record Index Entry: [KeyLen(4) | KeyBytes | Offset(8) | Size(8)] */
+    b->backend->append(b->data_writer, final_buf, final_size);
+    b->backend->append(b->data_writer, &compression_flag, 1);
+    b->backend->append(b->data_writer, &checksum, 4);
+
     size_t required_idx = 4 + b->last_key_len + 8 + 8;
     if (b->index_pos + required_idx > b->index_cap) {
         b->index_cap *= 2;
-        b->index_buf = (uint8_t *)aml_realloc(b->index_buf, b->index_cap);
+        b->index_buf = aml_realloc(b->index_buf, b->index_cap);
     }
     memcpy(&b->index_buf[b->index_pos], &b->last_key_len, 4); b->index_pos += 4;
     memcpy(&b->index_buf[b->index_pos], b->last_key, b->last_key_len); b->index_pos += b->last_key_len;
     memcpy(&b->index_buf[b->index_pos], &b->current_file_offset, 8); b->index_pos += 8;
 
-    uint64_t disk_size = final_size + 5; // payload + flag + crc
+    uint64_t disk_size = final_size + 5;
     memcpy(&b->index_buf[b->index_pos], &disk_size, 8); b->index_pos += 8;
-    b->num_index_entries++;
-
-    /* Write to I/O Batch Buffer */
-    if (b->io_pos + disk_size > IO_BUFFER_SIZE) {
-        fwrite(b->io_buf, 1, b->io_pos, b->file);
-        b->io_pos = 0;
-    }
-
-    memcpy(&b->io_buf[b->io_pos], final_buf, final_size); b->io_pos += final_size;
-    b->io_buf[b->io_pos++] = compression_flag;
-    memcpy(&b->io_buf[b->io_pos], &checksum, 4); b->io_pos += 4;
 
     b->current_file_offset += disk_size;
     b->block_pos = 0;
@@ -150,9 +151,44 @@ static void flush_data_block(sstable_builder_t *b) {
 bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
     if (b->block_pos > TARGET_BLOCK_SIZE) flush_data_block(b);
 
-    // --- FIX 2: Only hash the User Key into the Bloom Filter! ---
+    // 1. Calculate absolute maximum bytes this row could consume
+    size_t required_space = 15 + key_len + val_len; // 3 varints (max 5 bytes each) + key + val
+
+    // 2. DYNAMIC OVERFLOW PROTECTION
+    if (b->block_pos + required_space > b->block_capacity) {
+        b->block_capacity = b->block_pos + required_space + 4096;
+        b->block_buf = aml_realloc(b->block_buf, b->block_capacity);
+
+        // LZ4 requires the scratch buffer to handle the worst-case compression bounds
+        b->lz4_scratch_cap = LZ4_compressBound(b->block_capacity);
+        b->lz4_scratch = aml_realloc(b->lz4_scratch, b->lz4_scratch_cap);
+    }
+
     uint32_t user_key_len = key_len >= 8 ? key_len - 8 : key_len;
-    bloom_add(b->bloom, key, user_key_len);
+
+    if (b->filter_type == FILTER_BLOOM) {
+        bloom_add(b->bloom, key, user_key_len);
+    } else if (b->filter_type == FILTER_BITMAP && user_key_len >= 8) {
+        uint64_t current_id;
+        memcpy(&current_id, key, 8);
+
+        if (b->current_file_offset == 0 && b->entry_count == 0 && b->index_pos == 0) {
+            b->min_bitmap_id = current_id;
+        }
+
+        uint64_t diff = current_id - b->min_bitmap_id;
+        size_t byte_idx = diff / 8;
+        if (byte_idx >= b->bitmap_cap) {
+            size_t new_cap = b->bitmap_cap;
+            while (byte_idx >= new_cap) new_cap *= 2;
+            uint8_t *new_map = aml_zalloc(new_cap);
+            memcpy(new_map, b->bitmap, b->bitmap_cap);
+            aml_free(b->bitmap);
+            b->bitmap = new_map;
+            b->bitmap_cap = new_cap;
+        }
+        b->bitmap[byte_idx] |= (1 << (diff % 8));
+    }
 
     const char *key_str = (const char *)key;
     uint32_t shared = 0;
@@ -160,9 +196,9 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
     if (b->entry_count % RESTART_INTERVAL == 0) {
         if (b->num_restarts >= b->restarts_cap) {
             b->restarts_cap *= 2;
-            b->restarts = (uint32_t *)aml_realloc(b->restarts, b->restarts_cap * sizeof(uint32_t));
+            b->restarts = aml_realloc(b->restarts, b->restarts_cap * sizeof(uint32_t));
         }
-        if (b->block_pos > 0) b->restarts[b->num_restarts++] = (uint32_t)b->block_pos;
+        if (b->block_pos > 0) b->restarts[b->num_restarts++] = b->block_pos;
     } else {
         uint32_t min_len = (key_len < b->last_key_len) ? key_len : b->last_key_len;
         while (shared < min_len && key_str[shared] == b->last_key[shared]) shared++;
@@ -185,43 +221,64 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
 
 uint64_t sstable_builder_current_size(sstable_builder_t *b) {
     if (!b) return 0;
-    return b->current_file_offset + b->io_pos;
+    return b->current_file_offset;
 }
 
 uint64_t sstable_builder_finish(sstable_builder_t *b) {
     if (!b) return 0;
     if (b->block_pos > 0) flush_data_block(b);
-    if (b->io_pos > 0) { fwrite(b->io_buf, 1, b->io_pos, b->file); b->io_pos = 0; }
 
-    /* Write Bloom Filter */
-    uint64_t bloom_offset = b->current_file_offset;
-    uint64_t bloom_bits = (uint64_t)b->bloom->num_bits;
-    uint64_t bloom_hashes = (uint64_t)b->bloom->num_hashes;
-    size_t bloom_bytes = bloom_byte_size(b->bloom);
+    // FIX: Force data to platter before closing
+    b->backend->fsync_file(b->data_writer);
+    b->backend->close_writer(b->data_writer);
 
-    fwrite(&bloom_bits, 8, 1, b->file);
-    fwrite(&bloom_hashes, 8, 1, b->file);
-    fwrite(b->bloom->bits, 1, bloom_bytes, b->file);
-    b->current_file_offset += 16 + bloom_bytes;
+    char meta_path[520];
+    snprintf(meta_path, sizeof(meta_path), "%s.meta", b->base_path);
+    void *meta_writer = b->backend->open_writer(meta_path);
 
-    /* Write Index Block */
-    uint64_t index_offset = b->current_file_offset;
-    fwrite(&b->num_index_entries, 4, 1, b->file);
-    fwrite(b->index_buf, 1, b->index_pos, b->file);
-    b->current_file_offset += 4 + b->index_pos;
+    b->backend->append(meta_writer, "META", 4);
+    uint8_t f_type = (uint8_t)b->filter_type;
+    b->backend->append(meta_writer, &f_type, 1);
 
-    /* Write 24-byte Footer */
-    uint64_t magic = SSTABLE_MAGIC;
-    fwrite(&bloom_offset, 8, 1, b->file);
-    fwrite(&index_offset, 8, 1, b->file);
-    fwrite(&magic, 8, 1, b->file);
+    uint32_t filter_len = 0;
+    void *filter_data = NULL;
+    if (f_type == FILTER_BLOOM) {
+        filter_len = 16 + bloom_byte_size(b->bloom);
+        uint8_t *blm_buf = aml_malloc(filter_len);
+        uint64_t bits = b->bloom->num_bits;
+        uint64_t hashes = b->bloom->num_hashes;
+        memcpy(blm_buf, &bits, 8);
+        memcpy(blm_buf + 8, &hashes, 8);
+        memcpy(blm_buf + 16, b->bloom->bits, bloom_byte_size(b->bloom));
+        filter_data = blm_buf;
+    } else if (f_type == FILTER_BITMAP) {
+        filter_len = 8 + b->bitmap_cap;
+        uint8_t *bmp_buf = aml_malloc(filter_len);
+        memcpy(bmp_buf, &b->min_bitmap_id, 8);
+        memcpy(bmp_buf + 8, b->bitmap, b->bitmap_cap);
+        filter_data = bmp_buf;
+    }
 
-    uint64_t final_size = b->current_file_offset + 24;
+    b->backend->append(meta_writer, &filter_len, 4);
+    if (filter_len > 0) {
+        b->backend->append(meta_writer, filter_data, filter_len);
+        aml_free(filter_data);
+    }
 
-    fclose(b->file);
-    bloom_destroy(b->bloom);
-    aml_free(b->block_buf); aml_free(b->io_buf); aml_free(b->lz4_scratch); aml_free(b->restarts); aml_free(b->index_buf);
+    uint32_t idx_len = b->index_pos;
+    b->backend->append(meta_writer, &idx_len, 4);
+    b->backend->append(meta_writer, b->index_buf, idx_len);
+
+    // FIX: Force meta to platter before closing
+    b->backend->fsync_file(meta_writer);
+    b->backend->close_writer(meta_writer);
+
+    uint64_t final_data_size = b->current_file_offset;
+
+    if (b->bloom) bloom_destroy(b->bloom);
+    if (b->bitmap) aml_free(b->bitmap);
+    aml_free(b->block_buf); aml_free(b->lz4_scratch); aml_free(b->restarts); aml_free(b->index_buf);
     aml_free(b);
 
-    return final_size;
+    return final_data_size;
 }
