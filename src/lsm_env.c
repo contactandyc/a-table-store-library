@@ -23,6 +23,9 @@ lsm_env_t *lsm_env_init(size_t cache_bytes, size_t global_memtable_limit, int nu
     env->global_mem_limit = global_memtable_limit;
     atomic_init(&env->global_mem_usage, 0);
 
+    pthread_mutex_init(&env->global_mem_mutex, NULL);
+    pthread_cond_init(&env->global_mem_cond, NULL);
+
     env->global_wal = global_wal;
 
     env->tables_capacity = 256;
@@ -120,14 +123,17 @@ void lsm_env_recover_wal(lsm_env_t *env) {
 void lsm_env_destroy(lsm_env_t *env) {
     if (!env) return;
 
-    // FIX B16: Safely close any remaining orphaned DBs to guarantee graceful thread shutdown
     while (env->num_tables > 0) {
         lsm_db_close(env->tables[env->num_tables - 1]);
     }
 
     lsm_pool_destroy(env->bg_pool);
     lsm_cache_destroy(env->block_cache);
+
+    pthread_mutex_destroy(&env->global_mem_mutex);
+    pthread_cond_destroy(&env->global_mem_cond);
     pthread_mutex_destroy(&env->env_mutex);
+
     aml_free(env->tables);
     aml_free(env);
 }

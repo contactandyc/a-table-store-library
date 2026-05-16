@@ -37,6 +37,9 @@ struct lsm_wal_s {
     /* Force the OS to flush the log to physical media (fsync / O_DSYNC) */
     void (*sync)(lsm_wal_t *wal);
 
+    /* Signal that all records for 'table_id' up to 'seq_num' are durable in SSTables */
+    void (*checkpoint)(lsm_wal_t *wal, uint32_t table_id, uint64_t seq_num);
+
     /* Safely close the WAL */
     void (*close)(lsm_wal_t *wal);
 

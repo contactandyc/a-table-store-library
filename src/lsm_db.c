@@ -15,6 +15,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <time.h>
 
 #define COMPACTION_TRIGGER 4
 #define TRAILER_SIZE 8
@@ -49,6 +50,7 @@ struct lsm_db_s {
 
     lsm_manifest_t *manifest;
     uint64_t current_seq;
+    uint64_t imm_seq; // High-watermark of the sealed memtable
 
     pthread_mutex_t state_mutex;
     pthread_mutex_t write_mutex;
@@ -65,6 +67,7 @@ static void perform_flush_job(void *arg) {
 
     pthread_mutex_lock(&db->state_mutex);
     memtable_t *imm = db->imm_memtable;
+    uint64_t flushed_seq = db->imm_seq;
     pthread_mutex_unlock(&db->state_mutex);
 
     if (!imm) return;
@@ -104,15 +107,23 @@ static void perform_flush_job(void *arg) {
     sstable_meta_t *added[1] = { meta };
     lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1);
 
-    pthread_mutex_lock(&db->state_mutex);
+    // FIX: Checkpoint WAL after durability is established
+    if (db->env->global_wal && db->env->global_wal->checkpoint) {
+        db->env->global_wal->checkpoint(db->env->global_wal, db->table_id, flushed_seq);
+    }
 
+    pthread_mutex_lock(&db->state_mutex);
     memtable_release(db->imm_memtable);
     db->imm_memtable = NULL;
     db->is_flushing = false;
     pthread_cond_broadcast(&db->stall_cond);
     pthread_mutex_unlock(&db->state_mutex);
 
+    // FIX: Decrease mem usage and wake up writers stalled by limits
     atomic_fetch_sub(&db->env->global_mem_usage, freed_mem);
+    pthread_mutex_lock(&db->env->global_mem_mutex);
+    pthread_cond_broadcast(&db->env->global_mem_cond);
+    pthread_mutex_unlock(&db->env->global_mem_mutex);
 
     lsm_version_t *v = lsmc_version_retain(db->manifest);
     int target_lvl = -1;
@@ -161,13 +172,18 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
     lsm_db_t *db = aml_zalloc(sizeof(lsm_db_t));
     db->env = env;
     db->table_id = table_id;
+
+    // Safety against overrun
     strncpy(db->db_dir, db_directory, sizeof(db->db_dir) - 1);
+    db->db_dir[sizeof(db->db_dir) - 1] = '\0';
+
     db->ref_count = 1;
 
     db->manifest = lsmc_manifest_init(env, table_id, db_directory);
 
     uint64_t max_seq = lsmc_get_max_sequence(db->manifest);
     db->current_seq = max_seq > 0 ? max_seq : 1;
+    db->imm_seq = 0;
 
     db->memtable = memtable_init();
     atomic_fetch_add(&env->global_mem_usage, memtable_get_memory_usage(db->memtable));
@@ -196,31 +212,20 @@ void lsm_db_release(lsm_db_t *db) {
 
 void lsm_db_close(lsm_db_t *db) {
     if (!db) return;
+
+    // Step 1: Prevent new calls from the environment
     lsm_env_unregister_db(db->env, db);
 
+    // Step 2: Wait for user queries (puts/gets/iterators) to drain
     while (__atomic_load_n(&db->ref_count, __ATOMIC_SEQ_CST) > 1) {
         usleep(1000);
     }
 
+    // Step 3: Trigger final flush
     pthread_mutex_lock(&db->write_mutex);
-    pthread_mutex_lock(&db->state_mutex);
-
-    while (db->imm_memtable != NULL || db->is_flushing) {
-        pthread_mutex_unlock(&db->state_mutex);
-        pthread_mutex_unlock(&db->write_mutex);
-
-        pthread_mutex_lock(&db->state_mutex);
-        while (db->imm_memtable != NULL || db->is_flushing) {
-            pthread_cond_wait(&db->stall_cond, &db->state_mutex);
-        }
-        pthread_mutex_unlock(&db->state_mutex);
-
-        pthread_mutex_lock(&db->write_mutex);
-        pthread_mutex_lock(&db->state_mutex);
-    }
-
     if (memtable_first(db->memtable)) {
         db->imm_memtable = db->memtable;
+        db->imm_seq = db->current_seq;
         db->memtable = memtable_init();
         atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
 
@@ -228,19 +233,21 @@ void lsm_db_close(lsm_db_t *db) {
             db->env->global_wal->sync(db->env->global_wal);
         }
 
+        pthread_mutex_lock(&db->state_mutex);
         db->is_flushing = true;
         lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, 2);
+        pthread_mutex_unlock(&db->state_mutex);
     }
-
-    pthread_mutex_unlock(&db->state_mutex);
     pthread_mutex_unlock(&db->write_mutex);
 
+    // Step 4: Linearly wait for background jobs to finish
     pthread_mutex_lock(&db->state_mutex);
     while (db->imm_memtable != NULL || db->is_flushing || db->is_compacting) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
     pthread_mutex_unlock(&db->state_mutex);
 
+    // Step 5: Teardown
     atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
     memtable_release(db->memtable);
 
@@ -280,6 +287,7 @@ bool lsm_db_force_flush(lsm_db_t *db) {
     }
 
     db->imm_memtable = db->memtable;
+    db->imm_seq = db->current_seq; // FIX: Mark high watermark
     db->memtable = memtable_init();
     atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
 
@@ -316,8 +324,28 @@ void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t 
     atomic_fetch_add(&db->env->global_mem_usage, diff);
 }
 
+// FIX: Wait on condvar instead of cpu spinning
+static bool stall_for_memory(lsm_env_t *env) {
+    bool stall_failed = false;
+    pthread_mutex_lock(&env->global_mem_mutex);
+    while (atomic_load(&env->global_mem_usage) > (size_t)(env->global_mem_limit * 1.5)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5; // 5-second max write stall
+        int rc = pthread_cond_timedwait(&env->global_mem_cond, &env->global_mem_mutex, &ts);
+        if (rc != 0) {
+            stall_failed = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&env->global_mem_mutex);
+    return !stall_failed;
+}
+
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
     if (key_len > MAX_KEY_SIZE) return false;
+
+    lsm_db_retain(db); // FIX: Ensure safe db shutdown
 
     pthread_mutex_lock(&db->write_mutex);
     uint64_t seq = ++db->current_seq;
@@ -338,12 +366,16 @@ bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val
         lsm_db_force_flush(db);
     }
 
-    while (atomic_load(&db->env->global_mem_usage) > (size_t)(db->env->global_mem_limit * 1.5)) usleep(1000);
-    return true;
+    bool success = stall_for_memory(db->env);
+
+    lsm_db_release(db);
+    return success;
 }
 
 bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
     if (key_len > MAX_KEY_SIZE) return false;
+
+    lsm_db_retain(db);
 
     pthread_mutex_lock(&db->write_mutex);
     uint64_t seq = ++db->current_seq;
@@ -363,13 +395,19 @@ bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
         lsm_db_force_flush(db);
     }
 
-    while (atomic_load(&db->env->global_mem_usage) > (size_t)(db->env->global_mem_limit * 1.5)) usleep(1000);
-    return true;
+    bool success = stall_for_memory(db->env);
+
+    lsm_db_release(db);
+    return success;
 }
 
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint32_t *out_val_len) {
-    if (key_len > MAX_KEY_SIZE) return NULL;
+    lsm_db_retain(db); // FIX: Ensure db is safe during whole operation
 
+    if (key_len > MAX_KEY_SIZE) {
+        lsm_db_release(db);
+        return NULL;
+    }
     if (out_val_len) *out_val_len = 0;
 
     pthread_mutex_lock(&db->write_mutex);
@@ -494,6 +532,7 @@ cleanup:
     if (imm) memtable_release(imm);
     lsmc_version_release(db->manifest, v);
 
+    lsm_db_release(db); // Release the wrap lock
     return ret_val;
 }
 
@@ -586,6 +625,8 @@ static void advance_source(lsm_db_iter_t *it, iter_node_t *n) {
 }
 
 lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db) {
+    lsm_db_retain(db); // FIX: Ensure DB survives iteration
+
     lsm_db_iter_t *it = aml_zalloc(sizeof(lsm_db_iter_t));
     it->db = db;
 
@@ -709,5 +750,8 @@ void lsm_db_iter_destroy(lsm_db_iter_t *it) {
     lsmc_version_release(it->db->manifest, it->version);
 
     aml_free(it->ret_val_buf);
-    aml_free(it->readers); aml_free(it->iters); aml_free(it->heap); aml_free(it);
+    aml_free(it->readers); aml_free(it->iters); aml_free(it->heap);
+
+    lsm_db_release(it->db); // FIX: Match retain count
+    aml_free(it);
 }

@@ -30,6 +30,10 @@ typedef struct {
     size_t global_mem_limit;
     _Atomic size_t global_mem_usage;
 
+    // FIX: Condvar for efficient write stalling
+    pthread_mutex_t global_mem_mutex;
+    pthread_cond_t global_mem_cond;
+
     // --- Global Pluggable WAL ---
     lsm_wal_t *global_wal;
 
