@@ -135,6 +135,28 @@ MACRO_TEST(memtable_iteration_orders_keys_and_seqs_descending) {
     memtable_release(mt);
 }
 
+MACRO_TEST(memtable_isolates_primary_and_index_records) {
+    memtable_t *mt = memtable_init();
+
+    // 1. Insert into primary
+    MACRO_ASSERT_TRUE(memtable_put(mt, 1, OP_PUT, "user_alice", 10, "data_1", 6));
+
+    // 2. Insert into index
+    MACRO_ASSERT_TRUE(memtable_index_put(mt, 2, OP_PUT, "email_a@x.com", 13, "user_alice", 10));
+
+    // 3. Verify primary skiplist only has 1 item
+    memtable_row_t *p_row = memtable_first(mt);
+    MACRO_ASSERT_TRUE(p_row != NULL);
+    MACRO_ASSERT_TRUE(memtable_next(p_row) == NULL);
+
+    // 4. Verify index skiplist only has 1 item
+    memtable_row_index_t *i_row = memtable_index_first(mt);
+    MACRO_ASSERT_TRUE(i_row != NULL);
+    MACRO_ASSERT_TRUE(memtable_index_next(i_row) == NULL);
+
+    memtable_release(mt);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -145,6 +167,7 @@ int main(void) {
     MACRO_ADD(tests, memtable_snapshot_read_ignores_future_writes);
     MACRO_ADD(tests, memtable_snapshot_read_ignores_future_tombstones);
     MACRO_ADD(tests, memtable_iteration_orders_keys_and_seqs_descending);
+    MACRO_ADD(tests, memtable_isolates_primary_and_index_records);
 
     macro_run_all("lsm_memtable", tests, test_count);
     return 0;

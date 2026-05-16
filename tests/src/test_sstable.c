@@ -223,6 +223,45 @@ MACRO_TEST(sstable_dynamic_lz4_buffer_handling) {
     lsm_env_destroy(env);
 }
 
+MACRO_TEST(sstable_bitmap_filter_resists_non_monotonic_underflow) {
+    cleanup_files();
+    lsm_env_t *env = lsm_env_init(1024 * 1024, 1024 * 1024 * 10, 1,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+
+    const char *base = "/tmp/sstable_test_05";
+    // Initialize with FILTER_BITMAP
+    sstable_builder_t *b = sstable_builder_init(base, &local_posix_backend, 2, 100);
+
+    // Build 8-byte integer keys
+    uint64_t id1 = 5000;
+    uint64_t id2 = 10; // Much smaller! This caused the underflow crash.
+
+    char ikey1[1024], ikey2[1024];
+
+    // Pack ikey1 manually (8-byte ID + 8-byte trailer)
+    memcpy(ikey1, &id1, 8);
+    uint64_t trailer1 = (10ULL << 8) | 0; // seq 10, OP_PUT
+    for (int i = 0; i < 8; i++) ikey1[8 + i] = (trailer1 >> (i * 8)) & 0xFF;
+
+    // Pack ikey2 manually (8-byte ID + 8-byte trailer)
+    memcpy(ikey2, &id2, 8);
+    uint64_t trailer2 = (11ULL << 8) | 0; // seq 11, OP_PUT
+    for (int i = 0; i < 8; i++) ikey2[8 + i] = (trailer2 >> (i * 8)) & 0xFF;
+
+    // If Phase 3 failed, adding id2 will trigger an infinite memory allocation loop
+    sstable_builder_add(b, ikey1, 8 + 8, "val1", 4);
+    sstable_builder_add(b, ikey2, 8 + 8, "val2", 4);
+
+    uint64_t size = sstable_builder_finish(b);
+    MACRO_ASSERT_TRUE(size > 0);
+
+    sstable_reader_t *r = sstable_reader_init(base, &local_posix_backend, env, 1, 1);
+    MACRO_ASSERT_TRUE(r != NULL);
+
+    sstable_reader_destroy(r);
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -232,6 +271,7 @@ int main(void) {
     MACRO_ADD(tests, sstable_iterator_decodes_trailers_correctly);
     MACRO_ADD(tests, manifest_survives_torn_and_corrupt_writes);
     MACRO_ADD(tests, sstable_dynamic_lz4_buffer_handling);
+    MACRO_ADD(tests, sstable_bitmap_filter_resists_non_monotonic_underflow);
 
     macro_run_all("lsm_sstable_disk_format", tests, test_count);
     return 0;

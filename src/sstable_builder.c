@@ -100,7 +100,9 @@ sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backe
     if (filter_type == FILTER_BLOOM) {
         b->bloom = bloom_init(expected_elements, 0.01);
     } else if (filter_type == FILTER_BITMAP) {
-        b->bitmap_cap = 1024;
+        // [Phase 3 Fix] Start with a baseline capacity to prevent thrashing
+        size_t est_bytes = (expected_elements / 8) + 1;
+        b->bitmap_cap = est_bytes < 1024 ? 1024 : est_bytes;
         b->bitmap = aml_zalloc(b->bitmap_cap);
     }
 
@@ -163,9 +165,6 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
 
     size_t required_space = 15 + key_len + val_len;
 
-    // FIX: Exact capacity sizing protects against buffer overflow.
-    // Includes max potential restarts (4 bytes each), trailing restart count (4 bytes),
-    // and the block 9-byte trailer, + a generous 4KB variance for LZ4 framing.
     size_t slack = (b->restarts_cap * 4) + 4 + 9 + 4096;
 
     if (b->block_pos + required_space + slack > b->block_capacity) {
@@ -188,18 +187,26 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
             b->min_bitmap_id = current_id;
         }
 
-        uint64_t diff = current_id - b->min_bitmap_id;
-        size_t byte_idx = diff / 8;
-        if (byte_idx >= b->bitmap_cap) {
-            size_t new_cap = b->bitmap_cap;
-            while (byte_idx >= new_cap) new_cap *= 2;
-            uint8_t *new_map = aml_zalloc(new_cap);
-            memcpy(new_map, b->bitmap, b->bitmap_cap);
-            aml_free(b->bitmap);
-            b->bitmap = new_map;
-            b->bitmap_cap = new_cap;
+        // [Phase 3 Fix] Protect against non-monotonic ID underflows
+        if (current_id >= b->min_bitmap_id) {
+            uint64_t diff = current_id - b->min_bitmap_id;
+            size_t byte_idx = diff / 8;
+
+            // Limit bitmap allocation to ~1MB (8 million sequential IDs)
+            // Beyond that, the bitmap loses efficiency compared to Bloom
+            if (byte_idx < 1024 * 1024) {
+                if (byte_idx >= b->bitmap_cap) {
+                    size_t new_cap = b->bitmap_cap;
+                    while (byte_idx >= new_cap) new_cap *= 2;
+                    uint8_t *new_map = aml_zalloc(new_cap);
+                    memcpy(new_map, b->bitmap, b->bitmap_cap);
+                    aml_free(b->bitmap);
+                    b->bitmap = new_map;
+                    b->bitmap_cap = new_cap;
+                }
+                b->bitmap[byte_idx] |= (1 << (diff % 8));
+            }
         }
-        b->bitmap[byte_idx] |= (1 << (diff % 8));
     }
 
     const char *key_str = (const char *)key;

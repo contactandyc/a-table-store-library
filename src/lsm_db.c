@@ -563,8 +563,33 @@ bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
     return res;
 }
 
+// [Phase 3 Fix] Extracted helper to prevent scan logic duplication
+static int check_sstable_for_get(lsm_db_t *db, sstable_meta_t *meta, int lvl, const void *key, uint32_t key_len, uint64_t read_seq_num, void **disk_val, uint32_t *local_vlen) {
+    uint32_t umax = meta->max_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
+    uint32_t umin = meta->min_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->min_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
+
+    uint32_t min_cmp_len = key_len < umin ? key_len : umin;
+    int cmp_min = memcmp(key, meta->min_key, min_cmp_len);
+    if (cmp_min == 0) cmp_min = (key_len < umin) ? -1 : (key_len > umin ? 1 : 0);
+    if (cmp_min < 0) return 0; // Not in range
+
+    uint32_t max_cmp_len = key_len < umax ? key_len : umax;
+    int cmp_max = memcmp(key, meta->max_key, max_cmp_len);
+    if (cmp_max == 0) cmp_max = (key_len < umax) ? -1 : (key_len > umax ? 1 : 0);
+    if (cmp_max > 0) return 0; // Not in range
+
+    char base_path[512];
+    snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
+    lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
+    sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
+    if (!r) return 0;
+
+    int status = sstable_reader_get(r, key, key_len, read_seq_num, disk_val, local_vlen);
+    sstable_reader_destroy(r);
+    return status;
+}
+
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_seq_num, uint32_t *out_val_len) {
-    // [Phase 2 Fix] Reject traffic if closing
     pthread_mutex_lock(&db->state_mutex);
     if (db->is_closing) {
         pthread_mutex_unlock(&db->state_mutex);
@@ -612,35 +637,15 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
         }
     }
 
-    char base_path[512];
+    void *disk_val = NULL;
+
     for (int lvl = 0; lvl < MAX_LEVELS; lvl++) {
         if (v->levels[lvl].num_files == 0) continue;
 
         if (lvl == 0) {
+            // [Phase 3 Fix] Scan all overlapping L0 files uniformly
             for (int f = v->levels[lvl].num_files - 1; f >= 0; f--) {
-                sstable_meta_t *meta = v->levels[lvl].files[f];
-                uint32_t umax = meta->max_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
-                uint32_t umin = meta->min_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->min_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
-
-                uint32_t min_cmp_len = key_len < umin ? key_len : umin;
-                int cmp_min = memcmp(key, meta->min_key, min_cmp_len);
-                if (cmp_min == 0) cmp_min = (key_len < umin) ? -1 : (key_len > umin ? 1 : 0);
-                if (cmp_min < 0) continue;
-
-                uint32_t max_cmp_len = key_len < umax ? key_len : umax;
-                int cmp_max = memcmp(key, meta->max_key, max_cmp_len);
-                if (cmp_max == 0) cmp_max = (key_len < umax) ? -1 : (key_len > umax ? 1 : 0);
-                if (cmp_max > 0) continue;
-
-                snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
-                lsm_storage_backend_t *vfs = db->env->router.hot_vfs;
-                sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
-                if (!r) continue;
-
-                void *disk_val = NULL;
-                int status = sstable_reader_get(r, key, key_len, read_seq_num, &disk_val, &local_vlen);
-                sstable_reader_destroy(r);
-
+                int status = check_sstable_for_get(db, v->levels[lvl].files[f], lvl, key, key_len, read_seq_num, &disk_val, &local_vlen);
                 if (status == 1) {
                     ret_val = disk_val;
                     if (out_val_len) *out_val_len = local_vlen;
@@ -649,6 +654,7 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
                 else if (status == -1) goto cleanup;
             }
         } else {
+            // Binary search for exactly one intersecting file in L1+
             int left = 0, right = v->levels[lvl].num_files - 1, target_idx = -1;
             while(left <= right) {
                 int mid = left + (right - left)/2;
@@ -672,21 +678,13 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
             }
 
             if (target_idx != -1) {
-                sstable_meta_t *meta = v->levels[lvl].files[target_idx];
-                snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)meta->file_id);
-                lsm_storage_backend_t *vfs = (lvl >= db->env->router.cold_storage_start_level) ? db->env->router.cold_vfs : db->env->router.hot_vfs;
-                sstable_reader_t *r = sstable_reader_init(base_path, vfs, db->env, db->table_id, meta->file_id);
-                if (r) {
-                    void *disk_val = NULL;
-                    int status = sstable_reader_get(r, key, key_len, read_seq_num, &disk_val, &local_vlen);
-                    sstable_reader_destroy(r);
-                    if (status == 1) {
-                        ret_val = disk_val;
-                        if (out_val_len) *out_val_len = local_vlen;
-                        goto cleanup;
-                    }
-                    else if (status == -1) goto cleanup;
+                int status = check_sstable_for_get(db, v->levels[lvl].files[target_idx], lvl, key, key_len, read_seq_num, &disk_val, &local_vlen);
+                if (status == 1) {
+                    ret_val = disk_val;
+                    if (out_val_len) *out_val_len = local_vlen;
+                    goto cleanup;
                 }
+                else if (status == -1) goto cleanup;
             }
         }
     }

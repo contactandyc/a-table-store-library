@@ -515,6 +515,44 @@ MACRO_TEST(db_background_jobs_survives_db_handle_close) {
     lsm_env_destroy(env);
 }
 
+MACRO_TEST(db_compaction_overlap_and_starvation_prevention) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // Write overlapping sets of data to force the new L0 overlapping logic and L1+ pointers
+    lsm_db_put(db, "A", 1, "val_A", 5);
+    lsm_db_put(db, "M", 1, "val_M", 5);
+    lsm_db_force_flush(db);
+    usleep(50 * 1000);
+
+    lsm_db_put(db, "F", 1, "val_F", 5);
+    lsm_db_put(db, "Z", 1, "val_Z", 5);
+    lsm_db_force_flush(db);
+    usleep(50 * 1000);
+
+    lsm_db_put(db, "C", 1, "val_C", 5);
+    lsm_db_put(db, "Y", 1, "val_Y", 5);
+    lsm_db_force_flush(db);
+
+    // Give background compaction time to process the cascading overlaps
+    usleep(500 * 1000);
+
+    uint32_t vlen;
+    char *v = lsm_db_get(db, "A", 1, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL); free(v);
+
+    v = lsm_db_get(db, "M", 1, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL); free(v);
+
+    v = lsm_db_get(db, "Z", 1, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL); free(v);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -532,7 +570,7 @@ int main(void) {
     MACRO_ADD(tests, sstable_reader_defends_against_buffer_overflows);
     MACRO_ADD(tests, db_close_rejects_new_traffic_instantly);
     MACRO_ADD(tests, db_background_jobs_survives_db_handle_close);
-
+    MACRO_ADD(tests, db_compaction_overlap_and_starvation_prevention);
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;
 }

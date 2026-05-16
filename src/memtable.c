@@ -39,6 +39,7 @@ struct memtable_row_index_s {
 struct memtable_s {
     lsm_arena_t *arena;
     macro_skiplist_t *head;
+    macro_skiplist_t *index_head; // [Phase 3 Fix] Dedicated head for index rows
     int ref_count;
 };
 
@@ -138,8 +139,12 @@ memtable_t *memtable_init(void) {
     size_t head_size = sizeof(macro_skiplist_t) + (MEMTABLE_MAX_HEIGHT * sizeof(void*));
     mt->head = (macro_skiplist_t *)lsm_arena_alloc(mt->arena, head_size);
     macro_skiplist_init_head(mt->head, MEMTABLE_MAX_HEIGHT);
-    mt->ref_count = 1;
 
+    // [Phase 3 Fix] Allocate discrete memory structure for index items
+    mt->index_head = (macro_skiplist_t *)lsm_arena_alloc(mt->arena, head_size);
+    macro_skiplist_init_head(mt->index_head, MEMTABLE_MAX_HEIGHT);
+
+    mt->ref_count = 1;
     return mt;
 }
 
@@ -246,16 +251,16 @@ bool memtable_index_put(memtable_t *mt, uint64_t seq_num, op_type_t op,
     memcpy((char *)internal_index_sec_key(row), sec_key, sec_key_len);
     memcpy((char *)internal_index_pri_key(row), pri_key, pri_key_len);
 
-    return memtable_index_sl_insert(mt->head, row);
+    return memtable_index_sl_insert(mt->index_head, row); // [Phase 3 Fix] use index_head
 }
 
 memtable_row_index_t *memtable_index_search(memtable_t *mt, const void *sec_key, uint32_t sec_key_len) {
     index_lookup_t lookup = { .sec_key = (const char *)sec_key, .sec_key_len = sec_key_len };
-    return memtable_index_sl_lower_bound(mt->head, &lookup);
+    return memtable_index_sl_lower_bound(mt->index_head, &lookup); // [Phase 3 Fix] use index_head
 }
 
 memtable_row_index_t *memtable_index_first(memtable_t *mt) {
-    macro_skiplist_t *first = MACRO_ATOMIC_LOAD(&mt->head->forward[0], acquire);
+    macro_skiplist_t *first = MACRO_ATOMIC_LOAD(&mt->index_head->forward[0], acquire); // [Phase 3 Fix] use index_head
     return first ? macro_parent_object(first, memtable_row_index_t, link) : NULL;
 }
 

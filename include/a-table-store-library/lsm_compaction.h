@@ -31,8 +31,6 @@ typedef struct {
     char *max_key;
     uint32_t max_key_len;
 
-    // [Phase 1 Fix] Explicitly track the highest sequence number in this SSTable
-    // to prevent sequence re-use/duplication upon database restart.
     uint64_t max_seq;
 
     int ref_count;
@@ -62,6 +60,11 @@ typedef struct {
     pthread_mutex_t version_mutex;
 
     void *manifest_writer;
+
+    // [Phase 3 Fix] Compaction pointers to prevent starvation
+    char *compaction_pointers[MAX_LEVELS];
+    uint32_t compaction_pointer_lens[MAX_LEVELS];
+
 } lsm_manifest_t;
 
 lsm_manifest_t *lsmc_manifest_init(lsm_env_t *env, uint32_t table_id, const char *db_directory);
@@ -71,7 +74,6 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
                        sstable_meta_t **deleted_files, size_t num_deleted,
                        sstable_meta_t **added_files, size_t num_added);
 
-// FIX: Pinned oldest_snapshot added to correctly prune stale tombstone records
 bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t oldest_snapshot);
 
 uint64_t lsmc_get_max_sequence(lsm_manifest_t *manifest);
