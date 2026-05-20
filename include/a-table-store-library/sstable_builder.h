@@ -23,11 +23,15 @@ typedef struct sstable_builder_s sstable_builder_t;
  */
 sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backend_t *backend, int filter_type, size_t expected_elements);
 
+/* Returns false if an internal block flush hits an I/O error */
 bool sstable_builder_add(sstable_builder_t *builder, const void *key, uint32_t key_len, const void *val, uint32_t val_len);
 
 uint64_t sstable_builder_current_size(sstable_builder_t *builder);
 
-/* Writes the massive .data file and the merged .meta file */
+/* Writes the merged .meta file and fsyncs. Returns 0 on I/O failure. */
 uint64_t sstable_builder_finish(sstable_builder_t *builder);
+
+/* [Phase 4] Transactional rollback. Closes handles, deletes partial files from disk, and frees memory. */
+void sstable_builder_abort(sstable_builder_t *builder);
 
 #endif /* SSTABLE_BUILDER_H */

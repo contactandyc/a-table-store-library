@@ -22,7 +22,6 @@
 #define INTERNAL_KEY_TRAILER_SIZE 8
 #define MAX_INTERNAL_KEY_SIZE (MAX_KEY_SIZE + INTERNAL_KEY_TRAILER_SIZE)
 
-// --- Endianness Helpers ---
 static inline void encode_u32_le(uint8_t *dst, uint32_t v) {
     dst[0] = v & 0xFF; dst[1] = (v >> 8) & 0xFF; dst[2] = (v >> 16) & 0xFF; dst[3] = (v >> 24) & 0xFF;
 }
@@ -36,6 +35,7 @@ struct sstable_builder_s {
     char base_path[512];
 
     uint64_t current_file_offset;
+    bool has_error; // [Phase 4] Strict I/O tracking
 
     uint8_t *block_buf;
     size_t block_pos;
@@ -77,6 +77,7 @@ sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backe
     sstable_builder_t *b = aml_zalloc(sizeof(sstable_builder_t));
     b->backend = backend;
     b->filter_type = filter_type;
+    b->has_error = false;
     strncpy(b->base_path, base_path, 511);
 
     char data_path[520];
@@ -100,7 +101,6 @@ sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backe
     if (filter_type == FILTER_BLOOM) {
         b->bloom = bloom_init(expected_elements, 0.01);
     } else if (filter_type == FILTER_BITMAP) {
-        // [Phase 3 Fix] Start with a baseline capacity to prevent thrashing
         size_t est_bytes = (expected_elements / 8) + 1;
         b->bitmap_cap = est_bytes < 1024 ? 1024 : est_bytes;
         b->bitmap = aml_zalloc(b->bitmap_cap);
@@ -109,8 +109,29 @@ sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backe
     return b;
 }
 
-static void flush_data_block(sstable_builder_t *b) {
-    if (b->block_pos == 0) return;
+// [Phase 4] Safe Orphan File Cleanup
+void sstable_builder_abort(sstable_builder_t *b) {
+    if (!b) return;
+    if (b->data_writer) {
+        b->backend->close_writer(b->data_writer);
+    }
+
+    char path[520];
+    snprintf(path, sizeof(path), "%s.data", b->base_path);
+    b->backend->delete_file(path);
+
+    snprintf(path, sizeof(path), "%s.meta", b->base_path);
+    b->backend->delete_file(path); // Backend safely ignores this if it doesn't exist yet
+
+    if (b->bloom) bloom_destroy(b->bloom);
+    if (b->bitmap) aml_free(b->bitmap);
+    aml_free(b->block_buf); aml_free(b->lz4_scratch); aml_free(b->restarts); aml_free(b->index_buf);
+    aml_free(b);
+}
+
+static bool flush_data_block(sstable_builder_t *b) {
+    if (b->has_error) return false;
+    if (b->block_pos == 0) return true;
 
     for (size_t i = 0; i < b->num_restarts; i++) {
         encode_u32_le(&b->block_buf[b->block_pos], b->restarts[i]);
@@ -137,8 +158,9 @@ static void flush_data_block(sstable_builder_t *b) {
     trailer[4] = compression_flag;
     encode_u32_le(trailer + 5, checksum);
 
-    b->backend->append(b->data_writer, final_buf, final_size);
-    b->backend->append(b->data_writer, trailer, 9);
+    // [Phase 4] Strict I/O Return Checking
+    if (b->backend->append(b->data_writer, final_buf, final_size) < 0) { b->has_error = true; return false; }
+    if (b->backend->append(b->data_writer, trailer, 9) < 0) { b->has_error = true; return false; }
 
     size_t required_idx = 4 + b->last_key_len + 8 + 8;
     if (b->index_pos + required_idx > b->index_cap) {
@@ -158,13 +180,18 @@ static void flush_data_block(sstable_builder_t *b) {
     b->restarts[0] = 0;
     b->entry_count = 0;
     b->last_key_len = 0;
+
+    return true;
 }
 
 bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
-    if (b->block_pos > TARGET_BLOCK_SIZE) flush_data_block(b);
+    if (b->has_error) return false;
+
+    if (b->block_pos > TARGET_BLOCK_SIZE) {
+        if (!flush_data_block(b)) return false;
+    }
 
     size_t required_space = 15 + key_len + val_len;
-
     size_t slack = (b->restarts_cap * 4) + 4 + 9 + 4096;
 
     if (b->block_pos + required_space + slack > b->block_capacity) {
@@ -187,13 +214,10 @@ bool sstable_builder_add(sstable_builder_t *b, const void *key, uint32_t key_len
             b->min_bitmap_id = current_id;
         }
 
-        // [Phase 3 Fix] Protect against non-monotonic ID underflows
         if (current_id >= b->min_bitmap_id) {
             uint64_t diff = current_id - b->min_bitmap_id;
             size_t byte_idx = diff / 8;
 
-            // Limit bitmap allocation to ~1MB (8 million sequential IDs)
-            // Beyond that, the bitmap loses efficiency compared to Bloom
             if (byte_idx < 1024 * 1024) {
                 if (byte_idx >= b->bitmap_cap) {
                     size_t new_cap = b->bitmap_cap;
@@ -245,18 +269,27 @@ uint64_t sstable_builder_current_size(sstable_builder_t *b) {
 
 uint64_t sstable_builder_finish(sstable_builder_t *b) {
     if (!b) return 0;
-    if (b->block_pos > 0) flush_data_block(b);
 
-    b->backend->fsync_file(b->data_writer);
+    if (b->has_error) { sstable_builder_abort(b); return 0; }
+
+    if (b->block_pos > 0) flush_data_block(b);
+    if (b->has_error) { sstable_builder_abort(b); return 0; }
+
+    if (b->backend->fsync_file(b->data_writer) < 0) b->has_error = true;
     b->backend->close_writer(b->data_writer);
+    b->data_writer = NULL; // Safe from double-close during abort
+
+    if (b->has_error) { sstable_builder_abort(b); return 0; }
 
     char meta_path[520];
     snprintf(meta_path, sizeof(meta_path), "%s.meta", b->base_path);
     void *meta_writer = b->backend->open_writer(meta_path);
+    if (!meta_writer) { sstable_builder_abort(b); return 0; }
 
-    b->backend->append(meta_writer, "META", 4);
+    bool m_ok = true;
+    if (b->backend->append(meta_writer, "META", 4) < 0) m_ok = false;
     uint8_t f_type = (uint8_t)b->filter_type;
-    b->backend->append(meta_writer, &f_type, 1);
+    if (b->backend->append(meta_writer, &f_type, 1) < 0) m_ok = false;
 
     uint32_t filter_len = 0;
     void *filter_data = NULL;
@@ -277,19 +310,25 @@ uint64_t sstable_builder_finish(sstable_builder_t *b) {
 
     uint8_t sz_buf[4];
     encode_u32_le(sz_buf, filter_len);
-    b->backend->append(meta_writer, sz_buf, 4);
+    if (b->backend->append(meta_writer, sz_buf, 4) < 0) m_ok = false;
 
     if (filter_len > 0) {
-        b->backend->append(meta_writer, filter_data, filter_len);
+        if (b->backend->append(meta_writer, filter_data, filter_len) < 0) m_ok = false;
         aml_free(filter_data);
     }
 
     encode_u32_le(sz_buf, b->index_pos);
-    b->backend->append(meta_writer, sz_buf, 4);
-    b->backend->append(meta_writer, b->index_buf, b->index_pos);
+    if (b->backend->append(meta_writer, sz_buf, 4) < 0) m_ok = false;
+    if (b->backend->append(meta_writer, b->index_buf, b->index_pos) < 0) m_ok = false;
 
-    b->backend->fsync_file(meta_writer);
+    if (b->backend->fsync_file(meta_writer) < 0) m_ok = false;
     b->backend->close_writer(meta_writer);
+
+    if (!m_ok) {
+        b->backend->delete_file(meta_path); // Cleanup immediately
+        sstable_builder_abort(b);
+        return 0;
+    }
 
     uint64_t final_data_size = b->current_file_offset;
 

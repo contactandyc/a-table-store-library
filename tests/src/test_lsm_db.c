@@ -912,6 +912,73 @@ MACRO_TEST(db_wal_recovery_rejects_corrupted_batches) {
     lsm_env_destroy(env2);
 }
 
+// --- FAULTY VFS FOR DB ---
+static bool db_fault_delete_called = false;
+
+static int db_fault_fsync_file(void *f) {
+    (void)f; // FIX: Suppress unused parameter warning
+    return -1; // Permanently simulate a broken disk
+}
+
+// FIX: Changed return type from 'int' to 'bool'
+static bool db_fault_delete_file(const char *path) {
+    db_fault_delete_called = true;
+    return local_posix_backend.delete_file(path);
+}
+
+MACRO_TEST(db_flush_job_backs_off_and_avoids_deadlock) {
+    cleanup_db();
+
+    lsm_storage_backend_t fault_vfs;
+    memcpy(&fault_vfs, &local_posix_backend, sizeof(lsm_storage_backend_t));
+    fault_vfs.fsync_file = db_fault_fsync_file;
+    fault_vfs.delete_file = db_fault_delete_file;
+    db_fault_delete_called = false;
+
+    lsm_wal_t *wal = pool_to_lsm_wal("/tmp/lsm_db_test_wal", 1, 2);
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &fault_vfs, &fault_vfs, 2, wal);
+
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+    lsm_db_put(db, "vital_data", 10, "val1", 4);
+
+    // Force a flush. This dispatches the background job to the broken VFS.
+    lsm_db_force_flush(db);
+
+    // Wait for the background thread to fail, clean up, and exit.
+    // We poll the boolean flag because 'db' is an opaque struct to the test file.
+    for (int wait = 0; wait < 50; wait++) {
+        if (db_fault_delete_called) break;
+        usleep(100 * 1000); // Wait 100ms
+    }
+
+    // ASSERTION 1: The flush aborted and cleaned up the disk fragments
+    MACRO_ASSERT_TRUE(db_fault_delete_called);
+
+    // Now, call close! Because we fixed the deadlock loop, the close function
+    // will see the stranded imm_memtable, intentionally drop it, and shut down safely!
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+
+    // ASSERTION 2: WAL Recovery!
+    // Boot the DB back up with a fixed disk. The WAL should completely
+    // recover the dropped imm_memtable because the checkpoint was safely delayed!
+    wal = pool_to_lsm_wal("/tmp/lsm_db_test_wal", 1, 2);
+    env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                       &local_posix_backend, &local_posix_backend, 2, wal);
+    db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+    lsm_env_recover_wal(env);
+
+    uint32_t vlen;
+    char *v = lsm_db_get(db, "vital_data", 10, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    MACRO_ASSERT_TRUE(memcmp(v, "val1", 4) == 0);
+    if (v) aml_free(v);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -940,6 +1007,7 @@ int main(void) {
     MACRO_ADD(tests, db_group_commit_handles_concurrent_write_storms);
 
     MACRO_ADD(tests, db_wal_recovery_rejects_corrupted_batches);
+    MACRO_ADD(tests, db_flush_job_backs_off_and_avoids_deadlock);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

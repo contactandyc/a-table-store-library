@@ -193,6 +193,7 @@ static void perform_flush_job(void *arg) {
     memtable_row_t *row = memtable_first(imm);
     char ikey[MAX_INTERNAL_KEY_SIZE];
     uint64_t block_max_seq = 0;
+    bool io_error = false; // [Phase 4] Track I/O errors
 
     while (row) {
         uint32_t klen, vlen;
@@ -205,7 +206,11 @@ static void perform_flush_job(void *arg) {
         pack_internal_key(ikey, k, klen, seq, memtable_row_get_op(row));
         uint32_t iklen = klen + TRAILER_SIZE;
 
-        sstable_builder_add(builder, ikey, iklen, v, vlen);
+        if (!sstable_builder_add(builder, ikey, iklen, v, vlen)) {
+            io_error = true;
+            break;
+        }
+
         if (is_first) {
             meta->min_key = aml_malloc(iklen);
             memcpy(meta->min_key, ikey, iklen);
@@ -220,12 +225,59 @@ static void perform_flush_job(void *arg) {
         meta->num_entries++;
         row = memtable_next(row);
     }
-    meta->file_size = sstable_builder_finish(builder);
+
     meta->max_seq = block_max_seq;
 
-    sstable_meta_t *added[1] = { meta };
-    lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1);
+    if (!io_error) {
+        meta->file_size = sstable_builder_finish(builder);
+        if (meta->file_size == 0) io_error = true;
+    } else {
+        sstable_builder_abort(builder);
+    }
 
+    // [Phase 4] Fail-safe backoff on I/O error
+    if (io_error) {
+        if (meta->min_key) aml_free(meta->min_key);
+        if (meta->max_key) aml_free(meta->max_key);
+        pthread_mutex_destroy(&meta->reader_mutex);
+        aml_free(meta);
+
+        // Relinquish the state lock and leave data in imm_memtable so it safely retries later
+        pthread_mutex_lock(&db->state_mutex);
+        db->is_flushing = false;
+        pthread_cond_broadcast(&db->stall_cond);
+        pthread_mutex_unlock(&db->state_mutex);
+
+        if (imm) memtable_release(imm);
+        db_release_job(db);
+        lsm_db_release(db);
+        return;
+    }
+
+    sstable_meta_t *added[1] = { meta };
+
+    // [Phase 4] Enforce manifest atomicity before checkpointing
+    if (!lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1)) {
+        char dp[520]; snprintf(dp, 520, "%s.data", base_path); db->env->router.hot_vfs->delete_file(dp);
+        char mp[520]; snprintf(mp, 520, "%s.meta", base_path); db->env->router.hot_vfs->delete_file(mp);
+
+        if (meta->min_key) aml_free(meta->min_key);
+        if (meta->max_key) aml_free(meta->max_key);
+        pthread_mutex_destroy(&meta->reader_mutex);
+        aml_free(meta);
+
+        pthread_mutex_lock(&db->state_mutex);
+        db->is_flushing = false;
+        pthread_cond_broadcast(&db->stall_cond);
+        pthread_mutex_unlock(&db->state_mutex);
+
+        if (imm) memtable_release(imm);
+        db_release_job(db);
+        lsm_db_release(db);
+        return;
+    }
+
+    // [Phase 4] DELAYED CHECKPOINT: Only purge the WAL *after* the MemTable is securely durable in Manifest!
     if (db->env->global_wal && db->env->global_wal->checkpoint) {
         db->env->global_wal->checkpoint(db->env->global_wal, db->table_id, flushed_seq);
     }
@@ -290,7 +342,11 @@ static void perform_compaction_job(void *arg) {
         if (target_lvl == -1) break;
 
         uint64_t oldest_snap = get_oldest_snapshot(db);
-        lsmc_compact_level(db->manifest, target_lvl, oldest_snap);
+        if (!lsmc_compact_level(db->manifest, target_lvl, oldest_snap)) {
+            // Compaction Backoff: Safely halt loop on I/O error so we don't infinitely spin CPU
+            usleep(1000 * 1000); // Wait 1 second before allowing retry
+            break;
+        }
     }
 
     pthread_mutex_lock(&db->state_mutex);
@@ -383,9 +439,24 @@ void lsm_db_close(lsm_db_t *db) {
     while (db->active_ops > 0) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
+
+    // [Phase 4 Fix] Wait for any active background flush to finish or fail
+    // before we try to touch imm_memtable.
+    while (db->is_flushing) {
+        pthread_cond_wait(&db->stall_cond, &db->state_mutex);
+    }
     pthread_mutex_unlock(&db->state_mutex);
 
     pthread_mutex_lock(&db->write_mutex);
+
+    // [Phase 4 Fix] If a previous disk error stranded data here, safely drop it.
+    // The WAL acts as the ultimate source of truth and will recover it perfectly on next startup!
+    if (db->imm_memtable != NULL) {
+        atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->imm_memtable));
+        memtable_release(db->imm_memtable);
+        db->imm_memtable = NULL;
+    }
+
     if (memtable_first(db->memtable)) {
         db->imm_memtable = db->memtable;
         db->imm_seq = db->current_seq;
@@ -419,8 +490,19 @@ void lsm_db_close(lsm_db_t *db) {
 
     // Wait for all background jobs to finish (flush + any compactions it spawned)
     pthread_mutex_lock(&db->state_mutex);
-    while (db->active_jobs > 0 || db->imm_memtable != NULL || db->is_flushing || db->is_compacting) {
+
+    // NOTE: We no longer wait for `db->imm_memtable != NULL` here.
+    // We only wait for the active_jobs/flushing flags to clear.
+    while (db->active_jobs > 0 || db->is_flushing || db->is_compacting) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
+    }
+
+    // [Phase 4 Fix] If the final flush ALSO failed due to a disk error, safely drop it now.
+    // This prevents the shutdown sequence from deadlocking.
+    if (db->imm_memtable != NULL) {
+        atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->imm_memtable));
+        memtable_release(db->imm_memtable);
+        db->imm_memtable = NULL;
     }
     pthread_mutex_unlock(&db->state_mutex);
 

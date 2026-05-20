@@ -405,14 +405,22 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
         uint32_t crc = XXH32(buf, record_len, 0);
         uint8_t wrap[4];
 
+        // [Phase 4] Transactional Error Checking for Manifest IO
+        bool ok = true;
         encode_u32_le(wrap, record_len);
-        manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4);
-        manifest->env->router.hot_vfs->append(manifest->manifest_writer, buf, record_len);
+        if (manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4) < 0) ok = false;
+        if (ok && manifest->env->router.hot_vfs->append(manifest->manifest_writer, buf, record_len) < 0) ok = false;
         encode_u32_le(wrap, crc);
-        manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4);
+        if (ok && manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4) < 0) ok = false;
+        if (ok && manifest->env->router.hot_vfs->fsync_file(manifest->manifest_writer) < 0) ok = false;
 
-        manifest->env->router.hot_vfs->fsync_file(manifest->manifest_writer);
         aml_free(buf);
+
+        if (!ok) {
+            // Memory state remains untainted, safely return false
+            pthread_mutex_unlock(&manifest->version_mutex);
+            return false;
+        }
     }
 
     lsm_version_t *v = aml_zalloc(sizeof(lsm_version_t));
@@ -456,23 +464,18 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
         }
     }
 
-    // [Phase 5C Fix] Compute Compaction Score for the new version
     double best_score = -1.0;
     int best_level = -1;
 
     for (int i = 0; i < MAX_LEVELS - 1; i++) {
         double score = 0.0;
         if (i == 0) {
-            // L0 relies on file counts because overlapping files destroy read performance
             score = (double)v->levels[0].num_files / 4.0;
         } else {
-            // L1+ rely strictly on geometric byte limits
             uint64_t level_bytes = 0;
             for (size_t f = 0; f < v->levels[i].num_files; f++) {
                 level_bytes += v->levels[i].files[f]->file_size;
             }
-
-            // L1 target = 10MB. L2 = 100MB. L3 = 1GB...
             uint64_t max_bytes = 10 * 1048576ULL;
             for (int j = 1; j < i; j++) {
                 max_bytes *= 10;
@@ -532,10 +535,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
 
     source_inputs[num_source_inputs++] = L_source->files[start_idx];
 
-    uint32_t ptr_len = get_user_key_len(source_inputs[num_source_inputs-1]->max_key_len);
-    char *next_ptr = aml_malloc(ptr_len);
-    memcpy(next_ptr, source_inputs[num_source_inputs-1]->max_key, ptr_len);
-
     if (source_level == 0) {
         bool expanded;
         do {
@@ -563,6 +562,20 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
             }
         } while (expanded);
     }
+
+    // [Phase 4] Accurate Pointers: Identify the true max_key AFTER the expansion loop completes
+    sstable_meta_t *max_cand = source_inputs[0];
+    for (size_t i = 1; i < num_source_inputs; i++) {
+        uint32_t ulen1 = get_user_key_len(max_cand->max_key_len);
+        uint32_t ulen2 = get_user_key_len(source_inputs[i]->max_key_len);
+        uint32_t min_len = ulen1 < ulen2 ? ulen1 : ulen2;
+        int c = memcmp(max_cand->max_key, source_inputs[i]->max_key, min_len);
+        if (c == 0) c = ulen1 < ulen2 ? -1 : (ulen1 > ulen2 ? 1 : 0);
+        if (c < 0) max_cand = source_inputs[i];
+    }
+    uint32_t ptr_len = get_user_key_len(max_cand->max_key_len);
+    char *next_ptr = aml_malloc(ptr_len);
+    memcpy(next_ptr, max_cand->max_key, ptr_len);
 
     sstable_meta_t **merge_inputs = aml_malloc((num_source_inputs + L_target->num_files) * sizeof(sstable_meta_t*));
     size_t num_inputs = 0;
@@ -599,7 +612,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
             vfs = manifest->env->router.cold_vfs;
         }
 
-        // [Phase 5B Fix] Use the shared cached reader to merge data during compaction
         sstable_reader_t *r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
         if (!r) {
             pthread_mutex_lock(&meta->reader_mutex);
@@ -630,7 +642,8 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     }
 
     size_t new_files_cap = 1024;
-    sstable_meta_t **new_files = aml_malloc(new_files_cap * sizeof(sstable_meta_t*));
+    sstable_meta_t **new_files = aml_zalloc(new_files_cap * sizeof(sstable_meta_t*));
+    size_t num_allocated_new_files = 0;
     size_t num_new_files = 0;
     sstable_builder_t *builder = NULL;
 
@@ -648,6 +661,7 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     bool is_bottom_level = (source_level + 1 == MAX_LEVELS - 1);
 
     uint64_t last_kept_seq = UINT64_MAX;
+    bool compaction_failed = false; // [Phase 4] Fail-safe tracking
 
     while (heap.size > 0) {
         heap_node_t top = lsmc_heap_pop(&heap);
@@ -679,27 +693,32 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
                 lsmc_generate_base_path(filepath, manifest->db_directory, current_out_id);
                 builder = sstable_builder_init(filepath, target_vfs, FILTER_BLOOM, 20000);
 
-                if (num_new_files >= new_files_cap) {
+                if (num_allocated_new_files >= new_files_cap) {
                     new_files_cap *= 2;
                     new_files = aml_realloc(new_files, new_files_cap * sizeof(sstable_meta_t*));
+                    // Zero the newly allocated portion
+                    memset(new_files + num_allocated_new_files, 0, (new_files_cap - num_allocated_new_files) * sizeof(sstable_meta_t*));
                 }
 
-                new_files[num_new_files] = aml_zalloc(sizeof(sstable_meta_t));
-                new_files[num_new_files]->file_id = current_out_id;
+                new_files[num_allocated_new_files] = aml_zalloc(sizeof(sstable_meta_t));
+                new_files[num_allocated_new_files]->file_id = current_out_id;
+                pthread_mutex_init(&new_files[num_allocated_new_files]->reader_mutex, NULL);
+                new_files[num_allocated_new_files]->cached_reader = NULL;
 
-                pthread_mutex_init(&new_files[num_new_files]->reader_mutex, NULL);
-                new_files[num_new_files]->cached_reader = NULL;
-
-                new_files[num_new_files]->min_key = aml_malloc(top.key_len);
-                memcpy(new_files[num_new_files]->min_key, top.key, top.key_len);
-                new_files[num_new_files]->min_key_len = top.key_len;
+                new_files[num_allocated_new_files]->min_key = aml_malloc(top.key_len);
+                memcpy(new_files[num_allocated_new_files]->min_key, top.key, top.key_len);
+                new_files[num_allocated_new_files]->min_key_len = top.key_len;
+                num_allocated_new_files++;
             }
 
             if (top.seq > new_files[num_new_files]->max_seq) {
                 new_files[num_new_files]->max_seq = top.seq;
             }
 
-            sstable_builder_add(builder, top.key, top.key_len, top.val, top.val_len);
+            if (!sstable_builder_add(builder, top.key, top.key_len, top.val, top.val_len)) {
+                compaction_failed = true;
+                break;
+            }
 
             if (new_files[num_new_files]->max_key) aml_free(new_files[num_new_files]->max_key);
             new_files[num_new_files]->max_key = aml_malloc(top.key_len);
@@ -709,8 +728,14 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
             new_files[num_new_files]->num_entries++;
 
             if (sstable_builder_current_size(builder) >= TARGET_FILE_SIZE) {
-                new_files[num_new_files]->file_size = sstable_builder_finish(builder);
+                uint64_t fsz = sstable_builder_finish(builder);
                 builder = NULL;
+                if (fsz == 0) {
+                    compaction_failed = true;
+                    break;
+                }
+
+                new_files[num_new_files]->file_size = fsz;
                 num_new_files++;
 
                 pthread_mutex_lock(&manifest->version_mutex);
@@ -729,13 +754,44 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
         }
     }
 
-    if (builder != NULL) {
-        new_files[num_new_files]->file_size = sstable_builder_finish(builder);
-        num_new_files++;
+    if (!compaction_failed && builder != NULL) {
+        uint64_t fsz = sstable_builder_finish(builder);
+        builder = NULL;
+        if (fsz == 0) {
+            compaction_failed = true;
+        } else {
+            new_files[num_new_files]->file_size = fsz;
+            num_new_files++;
+        }
     }
 
     for (size_t i = 0; i < num_inputs; i++) {
         sstable_iter_destroy(iters[i]);
+    }
+
+    // [Phase 4] Safe Orphan Cleanup on I/O Errors
+    if (compaction_failed || !lsmc_version_edit(manifest, source_level, source_level + 1, merge_inputs, num_inputs, new_files, num_new_files)) {
+        if (builder) sstable_builder_abort(builder);
+
+        for (size_t i = 0; i < num_allocated_new_files; i++) {
+            if (i < num_new_files) {
+                // If it succeeded previously but the later batches or manifest failed, shred the disk evidence
+                char base[512], datapath[520], metapath[520];
+                lsmc_generate_base_path(base, manifest->db_directory, new_files[i]->file_id);
+                snprintf(datapath, 520, "%s.data", base);
+                snprintf(metapath, 520, "%s.meta", base);
+                target_vfs->delete_file(datapath);
+                target_vfs->delete_file(metapath);
+            }
+            if (new_files[i]->min_key) aml_free(new_files[i]->min_key);
+            if (new_files[i]->max_key) aml_free(new_files[i]->max_key);
+            pthread_mutex_destroy(&new_files[i]->reader_mutex);
+            aml_free(new_files[i]);
+        }
+        aml_free(merge_inputs); aml_free(iters); aml_free(heap.data);
+        aml_free(new_files); aml_free(next_ptr);
+        lsmc_version_release(manifest, v);
+        return false;
     }
 
     pthread_mutex_lock(&manifest->version_mutex);
@@ -746,7 +802,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     manifest->compaction_pointer_lens[source_level] = ptr_len;
     pthread_mutex_unlock(&manifest->version_mutex);
 
-    lsmc_version_edit(manifest, source_level, source_level + 1, merge_inputs, num_inputs, new_files, num_new_files);
     lsmc_version_release(manifest, v);
 
     aml_free(merge_inputs); aml_free(iters); aml_free(heap.data); aml_free(new_files);

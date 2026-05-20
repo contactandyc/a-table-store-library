@@ -304,6 +304,11 @@ MACRO_TEST(manifest_rejects_malicious_allocations) {
 
     lsmc_version_release(m, m->current_version);
     aml_free(m->db_directory);
+
+    if (m->manifest_writer) {
+        env->router.hot_vfs->close_writer(m->manifest_writer);
+    }
+
     aml_free(m);
     lsm_env_destroy(env);
 }
@@ -402,6 +407,51 @@ MACRO_TEST(sstable_bitmap_filter_allows_out_of_range_reads) {
     lsm_env_destroy(env);
 }
 
+// --- FAULTY VFS FOR BUILDER ---
+static int fault_fsync_count = 0;
+static bool fault_delete_called = false;
+
+static int fault_fsync_file(void *f) {
+    if (fault_fsync_count == 0) return -1; // Simulate I/O failure!
+    fault_fsync_count--;
+    return local_posix_backend.fsync_file(f);
+}
+
+// FIX: Changed return type from 'int' to 'bool'
+static bool fault_delete_file(const char *path) {
+    fault_delete_called = true;
+    return local_posix_backend.delete_file(path);
+}
+
+MACRO_TEST(sstable_builder_cleans_up_on_io_error) {
+    cleanup_files();
+
+    lsm_storage_backend_t fault_vfs;
+    memcpy(&fault_vfs, &local_posix_backend, sizeof(lsm_storage_backend_t));
+    fault_vfs.fsync_file = fault_fsync_file;
+    fault_vfs.delete_file = fault_delete_file;
+
+    fault_fsync_count = 0; // Fail on the very first fsync (the data file)
+    fault_delete_called = false;
+
+    const char *base = "/tmp/sstable_fault_test";
+    sstable_builder_t *b = sstable_builder_init(base, &fault_vfs, FILTER_NONE, 10);
+    MACRO_ASSERT_TRUE(b != NULL);
+
+    char ikey[1024];
+    pack_binary_ikey(ikey, "key1", 4, 1, OP_PUT);
+    sstable_builder_add(b, ikey, 4 + 8, "val1", 4);
+
+    // Attempt to finish. The fsync should fail, trigger an abort, delete the files, and return 0.
+    uint64_t size = sstable_builder_finish(b);
+    MACRO_ASSERT_EQ_INT(size, 0);
+
+    // ASSERTION: The builder explicitly cleaned up the orphaned files via delete!
+    MACRO_ASSERT_TRUE(fault_delete_called);
+
+    FILE *f = fopen("/tmp/sstable_fault_test.data", "r");
+    MACRO_ASSERT_TRUE(f == NULL); // Should not exist
+}
 
 int main(void) {
     macro_test_case tests[256];
@@ -416,6 +466,7 @@ int main(void) {
     MACRO_ADD(tests, manifest_rejects_malicious_allocations);
     MACRO_ADD(tests, sstable_reader_rejects_restart_array_underflow);
     MACRO_ADD(tests, sstable_bitmap_filter_allows_out_of_range_reads);
+    MACRO_ADD(tests, sstable_builder_cleans_up_on_io_error);
 
     macro_run_all("lsm_sstable_disk_format", tests, test_count);
     return 0;

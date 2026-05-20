@@ -29,15 +29,15 @@ This phase armored the boundary between the OS file system and our in-memory poi
 * **Bitmap Filter False-Negative Resolution:** Fixed a critical data-loss vulnerability where integer keys exceeding the builder's dynamic bitmap capacity were falsely reported as "Not Found" by the reader. The reader now treats out-of-bounds bitmap queries as a "maybe" and correctly falls back to a deterministic index search.
 * **Strongly-Typed Cache Pointers:** Eliminated the unsafe `uint64_t` integer casting used to track memory offsets inside the SSTable iterator. Replaced it with a strongly-typed `lsm_cache_handle_t *` pointer to guarantee safe reference counting and prevent Use-After-Free (UAF) crashes during block transitions.
 
-### Phase 4: Make Flush/Compaction Transactional
+### Phase 4: Transactional I/O & Graceful Degradation
 
-This phase guarantees that background I/O operations are fully atomic and gracefully recover from storage failures.
+This phase elevated background flush and compaction jobs to strict ACID transactions. It guarantees that the database will intelligently back off, clean up after itself, and preserve data integrity even when the underlying disk runs out of space, becomes read-only, or experiences intermittent hardware faults.
 
-* **Strict Return Checking:** Check the result of every builder, append, finish, manifest edit, and fsync operation.
-* **Delayed Checkpoints:** Only checkpoint the WAL *after* SSTable data, SSTable metadata, and the manifest edit are fully synced and guaranteed durable.
-* **Orphan Cleanup:** Automatically delete partial or corrupted files upon any I/O failure.
-* **Compaction Backoff:** Break out of or back off compaction loops on failure to prevent the background thread from endlessly spinning on a bad disk sector.
-* **Accurate Pointers:** Move the compaction pointer update so it occurs *after* the final input expansion, ensuring it accurately represents the compacted range.
+* **Strict Return Checking & Atomicity:** Eliminated blind disk writes. Every `append` and `fsync_file` operation within the SSTable builder and manifest version edits is now strictly validated. If the OS returns an error, the pipeline immediately halts and cascades a failure boolean up the stack, preventing corrupted internal memory states.
+* **Automated Orphan File Cleanup:** Introduced `sstable_builder_abort()` and transactional rollback semantics in `lsm_compaction.c`. If a flush or compaction fails midway through, the engine automatically deletes any partial `.data` and `.meta` fragments left on disk, ensuring the data directory remains pristine.
+* **Delayed WAL Checkpoints & Data Preservation:** Repositioned the WAL checkpoint trigger to execute strictly *after* the manifest edit is fully `fsync`'d to disk. If a flush job fails due to disk space, the stranded data is left safely in `db->imm_memtable` (or flawlessly recovered from the WAL upon restart) rather than being permanently lost.
+* **Compaction Backoff & Shutdown Deadlock Resolution:** Added a 1-second backoff sleep to `perform_compaction_job` to prevent the background thread from endlessly spinning at 100% CPU when a disk fails. Additionally, fixed a critical shutdown deadlock in `lsm_db_close` so the database can safely exit and release memory even when an active `imm_memtable` is stranded by a broken drive.
+* **Accurate Starvation Pointers:** Fixed a logical bug in `lsmc_compact_level` where the compaction pointer was calculated too early. The pointer is now accurately extracted from the true `max_key` strictly *after* the L0 overlap expansion loop completes, ensuring level compactions advance cleanly without starving overlapping ranges.
 
 ### Phase 5: Comprehensive Testing
 
