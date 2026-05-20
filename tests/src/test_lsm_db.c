@@ -7,10 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "a-table-store-library/lsm_env.h"
 #include "a-table-store-library/lsm_db.h"
 #include "a-table-store-library/sstable_builder.h"
 #include "a-table-store-library/sstable_reader.h"
+#include "a-memory-library/aml_alloc.h"
 #include "the-macro-library/macro_test.h"
 
 static void cleanup_db() {
@@ -59,7 +61,7 @@ MACRO_TEST(db_basic_put_get_delete) {
     char *v1 = lsm_db_get(db, "usr_1", 5, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v1 != NULL);
     MACRO_ASSERT_TRUE(memcmp(v1, "data_A", 6) == 0);
-    free(v1);
+    aml_free(v1);
 
     // Delete
     MACRO_ASSERT_TRUE(lsm_db_delete(db, "usr_1", 5));
@@ -85,7 +87,7 @@ MACRO_TEST(db_force_flush_and_read_from_sstable) {
     char *v = lsm_db_get(db, "disk_key", 8, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_TRUE(memcmp(v, "disk_val", 8) == 0);
-    free(v);
+    aml_free(v);
 
     lsm_db_close(db);
     lsm_env_destroy(env);
@@ -204,12 +206,12 @@ MACRO_TEST(db_l0_cascading_compaction_consolidates_correctly) {
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_EQ_INT(vlen, 7);
     MACRO_ASSERT_TRUE(memcmp(v, "new_two", 7) == 0);
-    free(v);
+    aml_free(v);
 
     v = lsm_db_get(db, "item_3", 6, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_TRUE(memcmp(v, "three", 5) == 0);
-    free(v);
+    aml_free(v);
 
     lsm_db_close(db);
     lsm_env_destroy(env);
@@ -224,7 +226,7 @@ MACRO_TEST(db_snapshots_provide_repeatable_reads) {
     // Time T1
     lsm_db_put(db, "bank_balance", 12, "100", 3);
 
-    // Freeze Time T1
+    // freeze Time T1
     uint64_t snap = lsm_db_take_snapshot(db);
 
     // Time T2
@@ -237,7 +239,7 @@ MACRO_TEST(db_snapshots_provide_repeatable_reads) {
     char *v_snap = lsm_db_get(db, "bank_balance", 12, snap, &vlen);
     MACRO_ASSERT_TRUE(v_snap != NULL);
     MACRO_ASSERT_TRUE(memcmp(v_snap, "100", 3) == 0);
-    free(v_snap);
+    aml_free(v_snap);
 
     char *v_snap2 = lsm_db_get(db, "new_account", 11, snap, &vlen);
     MACRO_ASSERT_TRUE(v_snap2 == NULL);
@@ -246,7 +248,7 @@ MACRO_TEST(db_snapshots_provide_repeatable_reads) {
     char *v_latest = lsm_db_get(db, "bank_balance", 12, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v_latest != NULL);
     MACRO_ASSERT_TRUE(memcmp(v_latest, "200", 3) == 0);
-    free(v_latest);
+    aml_free(v_latest);
 
     lsm_db_release_snapshot(db, snap);
     lsm_db_close(db);
@@ -275,7 +277,7 @@ MACRO_TEST(db_write_batch_applies_atomically) {
     v = lsm_db_get(db, "K2", 2, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL); // Inserted by batch
     MACRO_ASSERT_TRUE(memcmp(v, "V2", 2) == 0);
-    free(v);
+    aml_free(v);
 
     lsm_db_close(db);
     lsm_env_destroy(env);
@@ -312,14 +314,14 @@ MACRO_TEST(db_mvcc_survives_background_compaction) {
     char *v_latest = lsm_db_get(db, "target_key", 10, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v_latest != NULL);
     MACRO_ASSERT_TRUE(memcmp(v_latest, "VERSION_3", 9) == 0);
-    free(v_latest);
+    aml_free(v_latest);
 
     // 6. Snapshot read MUST see V1. If our compaction bug wasn't fixed,
     // V1 would have been deleted and this would return NULL or V3.
     char *v_snap = lsm_db_get(db, "target_key", 10, snap, &vlen);
     MACRO_ASSERT_TRUE(v_snap != NULL);
     MACRO_ASSERT_TRUE(memcmp(v_snap, "VERSION_1", 9) == 0);
-    free(v_snap);
+    aml_free(v_snap);
 
     lsm_db_release_snapshot(db, snap);
     lsm_db_close(db);
@@ -354,7 +356,7 @@ MACRO_TEST(db_sequence_numbers_restore_correctly_on_restart) {
     char *v = lsm_db_get(db2, "keyA", 4, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_TRUE(memcmp(v, "val_2", 5) == 0); // Must see the new value
-    free(v);
+    aml_free(v);
 
     lsm_db_close(db2);
     lsm_env_destroy(env2);
@@ -405,7 +407,70 @@ MACRO_TEST(sstable_reader_defends_against_buffer_overflows) {
     lsm_env_destroy(env);
 }
 
-// --- Phase 2 Concurrency & Lifecycle Validation Tests ---
+// --- Phase 1 Lifecycle Verification Tests ---
+
+MACRO_TEST(db_env_destroy_avoids_teardown_deadlock) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+    lsm_db_put(db, "teardown_test", 13, "data", 4);
+
+    // In the buggy code, lsm_env_destroy() retained the db and then called lsm_db_close().
+    // lsm_db_close() waited indefinitely for ref_count to drop to 1, deadlocking.
+    // Our Phase 1 fix decoupling owner_refs and active_ops prevents this deadlock entirely.
+    // If the test successfully completes and exits, the deadlock is fixed.
+    lsm_env_destroy(env);
+
+    MACRO_ASSERT_TRUE(true);
+}
+
+struct lease_drain_args {
+    lsm_db_t *db;
+    bool close_returned;
+};
+
+static void *close_thread_func(void *arg) {
+    struct lease_drain_args *args = (struct lease_drain_args*)arg;
+    lsm_db_close(args->db);
+    args->close_returned = true;
+    return NULL;
+}
+
+MACRO_TEST(db_active_lease_prevents_premature_close) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+    lsm_db_put(db, "lease_key", 9, "lease_val", 9);
+
+    // Acquire an operation lease directly via the public Iterator API
+    lsm_db_iter_t *it = lsm_db_iter_init(db, UINT64_MAX);
+    MACRO_ASSERT_TRUE(it != NULL);
+
+    struct lease_drain_args args = { .db = db, .close_returned = false };
+    pthread_t tid;
+    pthread_create(&tid, NULL, close_thread_func, &args);
+
+    // Give the closing thread time to trigger and wait.
+    // Because we hold an active_ops lease via the iterator, lsm_db_close MUST stall.
+    usleep(100 * 1000);
+
+    // Validate the closing thread is indeed safely blocked and hasn't destroyed our pointers
+    MACRO_ASSERT_FALSE(args.close_returned);
+
+    // Now release the lease
+    lsm_db_iter_destroy(it);
+
+    // The closing thread should now wake up, finish its job, and return
+    pthread_join(tid, NULL);
+    MACRO_ASSERT_TRUE(args.close_returned);
+
+    lsm_env_destroy(env);
+}
+
+
+// --- Phase 2 Concurrency Tests ---
 
 typedef struct {
     lsm_db_t *db;
@@ -418,22 +483,15 @@ typedef struct {
 static void *async_writer_thread(void *arg) {
     concurrent_writer_args_t *args = (concurrent_writer_args_t *)arg;
 
-    // Synchronize thread startup using standard portable mutex/condvar
     pthread_mutex_lock(args->mut);
     while (!*(args->start_flag)) {
         pthread_cond_wait(args->cond, args->mut);
     }
     pthread_mutex_unlock(args->mut);
 
-    // Attempt a write. If the database is closing or closed, this should return false.
+    // Attempt a write. If the database is closing or closed, this should cleanly return false
+    // without triggering a Use-After-Free.
     args->write_result = lsm_db_put(args->db, "concurrent_key", 14, "payload", 7);
-    return NULL;
-}
-
-struct close_runner { lsm_db_t *db; };
-
-static void *async_close_thread(void *arg) {
-    lsm_db_close(((struct close_runner*)arg)->db);
     return NULL;
 }
 
@@ -443,7 +501,7 @@ MACRO_TEST(db_close_rejects_new_traffic_instantly) {
                                   &local_posix_backend, &local_posix_backend, 2, NULL);
     lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
 
-    // Manually increment refcount to simulate an active long-running iterator or reader
+    // Manually increment owner_refs to simulate an active long-running external hold
     lsm_db_retain(db);
 
     pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
@@ -461,17 +519,15 @@ MACRO_TEST(db_close_rejects_new_traffic_instantly) {
     pthread_t thread;
     pthread_create(&thread, NULL, async_writer_thread, &writer_args);
 
-    // Explicitly trip the closing flag inside lsm_db_close.
-    // Because we held a manual ref loop above, close will block on the condvar wait safely
-    // rather than destroying the internal pointers immediately.
+    // Trigger the closing sequence in a background thread
     pthread_t close_thread;
-    struct close_runner c_args = { .db = db };
-    pthread_create(&close_thread, NULL, async_close_thread, &c_args);
+    struct lease_drain_args c_args = { .db = db };
+    pthread_create(&close_thread, NULL, close_thread_func, &c_args);
 
-    // Yield slightly to ensure the close sequence trips `is_closing`
+    // Yield slightly to ensure the close sequence trips `closing = true`
     usleep(50 * 1000);
 
-    // Give the green light to the concurrent writer to fire
+    // Unleash the concurrent writer
     pthread_mutex_lock(&mut);
     start_flag = true;
     pthread_cond_signal(&cond);
@@ -504,11 +560,11 @@ MACRO_TEST(db_background_jobs_survives_db_handle_close) {
     // Force a background flush sequence asynchronously
     lsm_db_force_flush(db);
 
-    // Immediately trigger close. Thanks to our Phase 2 ref tracking,
-    // lsm_db_close will block cleanly on the condition variable until the async job releases its lease.
+    // Immediately trigger close. Thanks to our Phase 1 active_jobs tracking,
+    // lsm_db_close will block cleanly on the condition variable until the async job completes.
     lsm_db_close(db);
 
-    // If Phase 2 job retention fails, this test will crash / throw memory faults
+    // If Phase 1 job retention fails, this test will crash / throw memory faults
     // before reaching this point due to the background worker accessing freed pointers.
     MACRO_ASSERT_TRUE(true);
 
@@ -541,13 +597,13 @@ MACRO_TEST(db_compaction_overlap_and_starvation_prevention) {
 
     uint32_t vlen;
     char *v = lsm_db_get(db, "A", 1, UINT64_MAX, &vlen);
-    MACRO_ASSERT_TRUE(v != NULL); free(v);
+    MACRO_ASSERT_TRUE(v != NULL); aml_free(v);
 
     v = lsm_db_get(db, "M", 1, UINT64_MAX, &vlen);
-    MACRO_ASSERT_TRUE(v != NULL); free(v);
+    MACRO_ASSERT_TRUE(v != NULL); aml_free(v);
 
     v = lsm_db_get(db, "Z", 1, UINT64_MAX, &vlen);
-    MACRO_ASSERT_TRUE(v != NULL); free(v);
+    MACRO_ASSERT_TRUE(v != NULL); aml_free(v);
 
     lsm_db_close(db);
     lsm_env_destroy(env);
@@ -566,7 +622,6 @@ typedef struct {
 static void *async_cache_reader(void *arg) {
     cache_reader_args_t *args = (cache_reader_args_t *)arg;
 
-    // Synchronize thread startup to hit the cache simultaneously
     pthread_mutex_lock(args->mut);
     while (!*(args->start_flag)) {
         pthread_cond_wait(args->cond, args->mut);
@@ -578,7 +633,7 @@ static void *async_cache_reader(void *arg) {
     if (v && vlen == 7 && memcmp(v, "hot_val", 7) == 0) {
         __atomic_fetch_add(&args->successes, 1, __ATOMIC_SEQ_CST);
     }
-    if (v) free(v);
+    if (v) aml_free(v);
     return NULL;
 }
 
@@ -638,12 +693,12 @@ MACRO_TEST(db_sstable_reader_caching_and_cleanup) {
     char *v = lsm_db_get(db, "cache_key_1", 11, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
     MACRO_ASSERT_TRUE(memcmp(v, "value_1", 7) == 0);
-    free(v);
+    aml_free(v);
 
     // Read 2: Hits the active cache
     v = lsm_db_get(db, "cache_key_1", 11, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
-    free(v);
+    aml_free(v);
 
     // Force compaction by pushing more files past the L0 limit
     for (int i=0; i<5; i++) {
@@ -659,7 +714,144 @@ MACRO_TEST(db_sstable_reader_caching_and_cleanup) {
     // Read 3: Reads from new L1 file (initializes new cache, old cache was safely destroyed)
     v = lsm_db_get(db, "cache_key_1", 11, UINT64_MAX, &vlen);
     MACRO_ASSERT_TRUE(v != NULL);
-    free(v);
+    aml_free(v);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(db_compaction_scoring_calculates_amplification) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    // Push 3 files to L0 (Trigger limit is 4).
+    for (int i = 0; i < 3; i++) {
+        char k[32]; snprintf(k, 32, "score_key_%d", i);
+        lsm_db_put(db, k, strlen(k), "val", 3);
+        lsm_db_force_flush(db);
+
+        // Safely wait for the flush to finish by checking L0 file count
+        size_t expected_l0 = i + 1;
+        size_t current_l0 = 0;
+        while (true) {
+            lsm_db_debug_get_compaction_metrics(db, NULL, NULL, &current_l0, NULL);
+            if (current_l0 >= expected_l0) break;
+            usleep(10 * 1000);
+        }
+    }
+
+    double score = 0;
+    int level = -1;
+    size_t l0 = 0, l1 = 0;
+
+    lsm_db_debug_get_compaction_metrics(db, &score, &level, &l0, &l1);
+
+    // With 3 files in L0, the score should be exactly 0.75 (3 / 4.0)
+    MACRO_ASSERT_EQ_INT(level, 0);
+    MACRO_ASSERT_TRUE(score >= 0.74 && score <= 0.76);
+
+    // Push a 4th file to push the score to 1.0 (Triggers compaction)
+    lsm_db_put(db, "trigger_key", 10, "val", 3);
+    lsm_db_force_flush(db);
+
+    // Polling loop instead of hard sleep to prevent CI flakiness
+    for (int wait = 0; wait < 50; wait++) {
+        lsm_db_debug_get_compaction_metrics(db, &score, &level, &l0, &l1);
+        // If the score dropped below 1.0, the background thread did its job
+        if (score < 1.0 && l1 > 0) break;
+        usleep(100 * 1000);
+    }
+
+    lsm_db_debug_get_compaction_metrics(db, &score, &level, &l0, &l1);
+
+    // L0 should have shed at least one file to drop the score below 1.0.
+    MACRO_ASSERT_TRUE(score < 1.0);
+    MACRO_ASSERT_TRUE(l0 < 4);
+    MACRO_ASSERT_TRUE(l1 > 0);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
+typedef struct {
+    lsm_db_t *db;
+    int thread_id;
+    pthread_mutex_t *mut;
+    pthread_cond_t *cond;
+    bool *start_flag;
+} group_commit_args_t;
+
+static void *async_group_writer(void *arg) {
+    group_commit_args_t *args = (group_commit_args_t *)arg;
+
+    pthread_mutex_lock(args->mut);
+    while (!*(args->start_flag)) {
+        pthread_cond_wait(args->cond, args->mut);
+    }
+    pthread_mutex_unlock(args->mut);
+
+    // Each thread writes 100 unique keys
+    for (int i = 0; i < 100; i++) {
+        char key[64];
+        char val[64];
+        snprintf(key, sizeof(key), "key_%d_%d", args->thread_id, i);
+        snprintf(val, sizeof(val), "val_%d_%d", args->thread_id, i);
+
+        lsm_db_put(args->db, key, strlen(key), val, strlen(val));
+    }
+    return NULL;
+}
+
+MACRO_TEST(db_group_commit_handles_concurrent_write_storms) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    int num_threads = 20;
+    pthread_t threads[20];
+    group_commit_args_t args[20];
+
+    pthread_mutex_t mut = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    bool start_flag = false;
+
+    for (int i = 0; i < num_threads; i++) {
+        args[i].db = db;
+        args[i].thread_id = i;
+        args[i].mut = &mut;
+        args[i].cond = &cond;
+        args[i].start_flag = &start_flag;
+        pthread_create(&threads[i], NULL, async_group_writer, &args[i]);
+    }
+
+    // Unleash the hounds
+    pthread_mutex_lock(&mut);
+    start_flag = true;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&mut);
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    // Verify absolutely every key made it into the database via the super-batches
+    uint32_t vlen;
+    for (int i = 0; i < num_threads; i++) {
+        for (int j = 0; j < 100; j++) {
+            char key[64];
+            char expected_val[64];
+            snprintf(key, sizeof(key), "key_%d_%d", i, j);
+            snprintf(expected_val, sizeof(expected_val), "val_%d_%d", i, j);
+
+            char *v = lsm_db_get(db, key, strlen(key), UINT64_MAX, &vlen);
+            MACRO_ASSERT_TRUE(v != NULL);
+            MACRO_ASSERT_TRUE(memcmp(v, expected_val, strlen(expected_val)) == 0);
+            aml_free(v);
+        }
+    }
 
     lsm_db_close(db);
     lsm_env_destroy(env);
@@ -680,11 +872,18 @@ int main(void) {
     MACRO_ADD(tests, db_mvcc_survives_background_compaction);
     MACRO_ADD(tests, db_sequence_numbers_restore_correctly_on_restart);
     MACRO_ADD(tests, sstable_reader_defends_against_buffer_overflows);
+
+    // Phase 1 Additions
+    MACRO_ADD(tests, db_env_destroy_avoids_teardown_deadlock);
+    MACRO_ADD(tests, db_active_lease_prevents_premature_close);
+
     MACRO_ADD(tests, db_close_rejects_new_traffic_instantly);
     MACRO_ADD(tests, db_background_jobs_survives_db_handle_close);
     MACRO_ADD(tests, db_compaction_overlap_and_starvation_prevention);
     MACRO_ADD(tests, db_concurrent_reads_init_cache_safely);
     MACRO_ADD(tests, db_sstable_reader_caching_and_cleanup);
+    MACRO_ADD(tests, db_compaction_scoring_calculates_amplification);
+    MACRO_ADD(tests, db_group_commit_handles_concurrent_write_storms);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

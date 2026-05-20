@@ -36,7 +36,7 @@ typedef struct {
     int ref_count;
     bool is_obsolete;
 
-    // [Phase 5B] Lazy-loaded, cached reader to prevent re-parsing metadata on every read
+    // [Phase 5B Fix] Lazy-loaded cached reader
     pthread_mutex_t reader_mutex;
     sstable_reader_t *cached_reader;
 
@@ -53,6 +53,10 @@ typedef struct {
 typedef struct lsm_version_s {
     lsm_level_t levels[MAX_LEVELS];
     int ref_count;
+
+    // [Phase 5C Fix] Pre-computed scores for dynamic compaction targeting
+    double compaction_score;
+    int compaction_level;
 } lsm_version_t;
 
 typedef struct {
@@ -66,6 +70,7 @@ typedef struct {
 
     void *manifest_writer;
 
+    // [Phase 3 Fix] Compaction pointers to prevent starvation
     char *compaction_pointers[MAX_LEVELS];
     uint32_t compaction_pointer_lens[MAX_LEVELS];
 

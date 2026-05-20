@@ -423,6 +423,39 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
         }
     }
 
+    // [Phase 5C Fix] Compute Compaction Score for the new version
+    double best_score = -1.0;
+    int best_level = -1;
+
+    for (int i = 0; i < MAX_LEVELS - 1; i++) {
+        double score = 0.0;
+        if (i == 0) {
+            // L0 relies on file counts because overlapping files destroy read performance
+            score = (double)v->levels[0].num_files / 4.0;
+        } else {
+            // L1+ rely strictly on geometric byte limits
+            uint64_t level_bytes = 0;
+            for (size_t f = 0; f < v->levels[i].num_files; f++) {
+                level_bytes += v->levels[i].files[f]->file_size;
+            }
+
+            // L1 target = 10MB. L2 = 100MB. L3 = 1GB...
+            uint64_t max_bytes = 10 * 1048576ULL;
+            for (int j = 1; j < i; j++) {
+                max_bytes *= 10;
+            }
+            score = (double)level_bytes / (double)max_bytes;
+        }
+
+        if (score > best_score) {
+            best_score = score;
+            best_level = i;
+        }
+    }
+
+    v->compaction_score = best_score;
+    v->compaction_level = best_level;
+
     lsm_version_t *old_version = manifest->current_version;
     manifest->current_version = v;
     pthread_mutex_unlock(&manifest->version_mutex);

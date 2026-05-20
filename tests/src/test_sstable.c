@@ -57,7 +57,7 @@ MACRO_TEST(sstable_build_and_read_roundtrip) {
     MACRO_ASSERT_EQ_INT(status, 1);
     MACRO_ASSERT_EQ_INT(vlen, 3);
     MACRO_ASSERT_TRUE(memcmp(val, "red", 3) == 0);
-    free(val);
+    aml_free(val);
 
     // Test miss
     status = sstable_reader_get(r, "banana", 6, UINT64_MAX, &val, &vlen);
@@ -157,7 +157,7 @@ MACRO_TEST(manifest_survives_torn_and_corrupt_writes) {
     m1->manifest_writer = NULL;
     pthread_mutex_destroy(&m1->version_mutex);
     lsmc_version_release(m1, m1->current_version);
-    free(m1->db_directory); free(m1);
+    aml_free(m1->db_directory); aml_free(m1);
 
     // 2. Open the manifest file manually and corrupt the end of it (append bad data bytes)
     char m_path[520];
@@ -183,7 +183,7 @@ MACRO_TEST(manifest_survives_torn_and_corrupt_writes) {
     }
     pthread_mutex_destroy(&m2->version_mutex);
     lsmc_version_release(m2, m2->current_version);
-    free(m2->db_directory); free(m2);
+    aml_free(m2->db_directory); aml_free(m2);
 
     lsm_env_destroy(env);
 }
@@ -197,7 +197,7 @@ MACRO_TEST(sstable_dynamic_lz4_buffer_handling) {
     sstable_builder_t *b = sstable_builder_init(base, &local_posix_backend, FILTER_NONE, 100);
 
     size_t huge_size = 200 * 1024;
-    char *huge_val = malloc(huge_size);
+    char *huge_val = aml_malloc(huge_size);
     memset(huge_val, 'X', huge_size);
 
     char ikey[1024];
@@ -217,8 +217,8 @@ MACRO_TEST(sstable_dynamic_lz4_buffer_handling) {
     MACRO_ASSERT_EQ_INT(vlen, huge_size);
     MACRO_ASSERT_TRUE(memcmp(val, huge_val, huge_size) == 0);
 
-    free(val);
-    free(huge_val);
+    aml_free(val);
+    aml_free(huge_val);
     sstable_reader_destroy(r);
     lsm_env_destroy(env);
 }

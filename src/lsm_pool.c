@@ -24,7 +24,6 @@ struct lsm_pool_s {
     lsm_job_node_t *queues[3];
     lsm_job_node_t *tails[3];
 
-    // [Phase 2 Fix] Track queued vs executing jobs to prevent premature shutdown exits
     int queued_jobs;
     int executing_jobs;
     bool shutdown;
@@ -90,7 +89,7 @@ lsm_pool_t *lsm_pool_init(int num_threads) {
     return pool;
 }
 
-void lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_priority_t priority) {
+bool lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_priority_t priority) {
     if (priority < 0 || priority > 2) priority = 0;
 
     lsm_job_node_t *node = aml_zalloc(sizeof(lsm_job_node_t));
@@ -99,11 +98,10 @@ void lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_p
 
     pthread_mutex_lock(&pool->queue_mutex);
 
-    // [Phase 2 Fix] Reject work safely if pool is shutting down
     if (pool->shutdown) {
         pthread_mutex_unlock(&pool->queue_mutex);
         aml_free(node);
-        return;
+        return false;
     }
 
     if (pool->tails[priority] == NULL) {
@@ -118,6 +116,7 @@ void lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_p
     pthread_cond_signal(&pool->queue_cond);
 
     pthread_mutex_unlock(&pool->queue_mutex);
+    return true;
 }
 
 void lsm_pool_destroy(lsm_pool_t *pool) {

@@ -7,6 +7,7 @@
 #define LSM_POOL_H
 
 #include <pthread.h>
+#include <stdbool.h>
 
 typedef struct lsm_pool_s lsm_pool_t;
 
@@ -20,7 +21,8 @@ typedef void (*lsm_job_func_t)(void *arg);
 
 lsm_pool_t *lsm_pool_init(int num_threads);
 
-void lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_priority_t priority);
+/* Returns false if the pool is shutting down and the job was rejected */
+bool lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_priority_t priority);
 
 void lsm_pool_destroy(lsm_pool_t *pool);
 

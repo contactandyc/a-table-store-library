@@ -79,9 +79,7 @@ void lsm_env_enforce_memory_limit(lsm_env_t *env) {
     pthread_mutex_unlock(&env->env_mutex);
 
     if (largest_db) {
-        if (max_size > 1024 * 1024) {
-            lsm_db_force_flush(largest_db);
-        }
+        lsm_db_force_flush(largest_db); // Removed arbitrary 1MB threshold
         lsm_db_release(largest_db);
     }
 }
@@ -143,11 +141,9 @@ void lsm_env_recover_wal(lsm_env_t *env) {
     if (iter->destroy) iter->destroy(iter);
 }
 
-
 void lsm_env_destroy(lsm_env_t *env) {
     if (!env) return;
 
-    // [Phase 2 Fix] Safely snapshot the table array under lock before closing to prevent teardown races
     pthread_mutex_lock(&env->env_mutex);
     size_t n_tables = env->num_tables;
     lsm_db_t **tables_copy = NULL;
@@ -162,7 +158,7 @@ void lsm_env_destroy(lsm_env_t *env) {
 
     for (size_t i = 0; i < n_tables; i++) {
         lsm_db_close(tables_copy[i]);
-        lsm_db_release(tables_copy[i]); // Release the retain we took above
+        lsm_db_release(tables_copy[i]);
     }
     if (tables_copy) aml_free(tables_copy);
 

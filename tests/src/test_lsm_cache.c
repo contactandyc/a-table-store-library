@@ -5,12 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "a-table-store-library/lsm_cache.h"
+#include "a-memory-library/aml_alloc.h"
 #include "the-macro-library/macro_test.h"
 
 MACRO_TEST(cache_basic_put_and_get) {
     lsm_cache_t *cache = lsm_cache_init(1024 * 1024); // 1MB
 
-    void *block = malloc(4096);
+    void *block = aml_malloc(4096);
     memset(block, 0xAA, 4096);
 
     lsm_cache_handle_t *h1 = lsm_cache_put_or_get(cache, 1, 100, 0, block, 4096);
@@ -32,8 +33,8 @@ MACRO_TEST(cache_basic_put_and_get) {
 MACRO_TEST(cache_deduplicates_racing_inserts) {
     lsm_cache_t *cache = lsm_cache_init(1024 * 1024);
 
-    void *block1 = malloc(4096);
-    void *block2 = malloc(4096);
+    void *block1 = aml_malloc(4096);
+    void *block2 = aml_malloc(4096);
 
     lsm_cache_handle_t *c1 = lsm_cache_put_or_get(cache, 1, 50, 0, block1, 4096);
     lsm_cache_handle_t *c2 = lsm_cache_put_or_get(cache, 1, 50, 0, block2, 4096);
@@ -50,12 +51,12 @@ MACRO_TEST(cache_deduplicates_racing_inserts) {
 MACRO_TEST(cache_lru_eviction_respects_capacity) {
     lsm_cache_t *cache = lsm_cache_init(1024 * 1024);
 
-    void *b1 = malloc(4096);
+    void *b1 = aml_malloc(4096);
     lsm_cache_handle_t *h_first = lsm_cache_put_or_get(cache, 1, 1, 0, b1, 4096);
     lsm_cache_handle_release(cache, h_first);
 
     for (uint64_t i = 2; i <= 500; i++) {
-        void *b = malloc(4096);
+        void *b = aml_malloc(4096);
         lsm_cache_handle_t *h = lsm_cache_put_or_get(cache, 1, i, 0, b, 4096);
         lsm_cache_handle_release(cache, h);
     }
@@ -74,7 +75,7 @@ MACRO_TEST(cache_pinned_blocks_prevent_eviction_without_hanging) {
 
     lsm_cache_handle_t *pins[501];
     for (uint64_t i = 1; i <= 500; i++) {
-        void *b = malloc(4096);
+        void *b = aml_malloc(4096);
         pins[i] = lsm_cache_put_or_get(cache, 1, i, 0, b, 4096);
     }
 

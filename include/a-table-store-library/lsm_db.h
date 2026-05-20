@@ -47,4 +47,6 @@ uint32_t lsm_db_get_table_id(lsm_db_t *db);
 size_t lsm_db_get_active_mem_usage(lsm_db_t *db);
 bool lsm_db_force_flush(lsm_db_t *db);
 
+void lsm_db_debug_get_compaction_metrics(lsm_db_t *db, double *score, int *level, size_t *l0_files, size_t *l1_files);
+
 #endif /* LSM_DB_H */

@@ -44,12 +44,23 @@ static inline void encode_u32_le_db(uint8_t *dst, uint32_t v) {
     dst[0] = v & 0xFF; dst[1] = (v >> 8) & 0xFF; dst[2] = (v >> 16) & 0xFF; dst[3] = (v >> 24) & 0xFF;
 }
 
+typedef struct lsm_writer_s {
+    lsm_write_batch_t *batch;
+    bool done;
+    bool success;
+    struct lsm_writer_s *next;
+    pthread_cond_t cv;
+} lsm_writer_t;
+
 struct lsm_db_s {
     uint32_t table_id;
     char db_dir[512];
     lsm_env_t *env;
 
-    int ref_count;
+    int owner_refs;
+    int active_ops;
+    int active_jobs;
+    bool closing;
 
     memtable_t *memtable;
     memtable_t *imm_memtable;
@@ -58,6 +69,7 @@ struct lsm_db_s {
     uint64_t current_seq;
     uint64_t imm_seq;
 
+    // Snapshot tracking
     uint64_t *snapshots;
     size_t num_snapshots;
     size_t snapshots_cap;
@@ -66,13 +78,47 @@ struct lsm_db_s {
     pthread_mutex_t write_mutex;
     pthread_cond_t stall_cond;
 
+    lsm_writer_t *writer_queue_head;
+    lsm_writer_t *writer_queue_tail;
+
     bool is_flushing;
     bool is_compacting;
-    bool is_closing;
 };
+
+// --- Lifecycle Operation Leases ---
+
+static bool db_try_acquire_op(lsm_db_t *db) {
+    pthread_mutex_lock(&db->state_mutex);
+    if (db->closing) {
+        pthread_mutex_unlock(&db->state_mutex);
+        return false;
+    }
+    db->active_ops++;
+    pthread_mutex_unlock(&db->state_mutex);
+    return true;
+}
+
+static void db_release_op(lsm_db_t *db) {
+    pthread_mutex_lock(&db->state_mutex);
+    db->active_ops--;
+    if (db->closing && db->active_ops == 0 && db->active_jobs == 0) {
+        pthread_cond_broadcast(&db->stall_cond);
+    }
+    pthread_mutex_unlock(&db->state_mutex);
+}
+
+static void db_release_job(lsm_db_t *db) {
+    pthread_mutex_lock(&db->state_mutex);
+    db->active_jobs--;
+    if (db->closing && db->active_ops == 0 && db->active_jobs == 0) {
+        pthread_cond_broadcast(&db->stall_cond);
+    }
+    pthread_mutex_unlock(&db->state_mutex);
+}
 
 // --- Snapshots ---
 uint64_t lsm_db_take_snapshot(lsm_db_t *db) {
+    if (!db_try_acquire_op(db)) return 0;
     pthread_mutex_lock(&db->write_mutex);
     uint64_t seq = db->current_seq;
     if (db->num_snapshots == db->snapshots_cap) {
@@ -81,10 +127,12 @@ uint64_t lsm_db_take_snapshot(lsm_db_t *db) {
     }
     db->snapshots[db->num_snapshots++] = seq;
     pthread_mutex_unlock(&db->write_mutex);
+    db_release_op(db);
     return seq;
 }
 
 void lsm_db_release_snapshot(lsm_db_t *db, uint64_t seq) {
+    if (!db_try_acquire_op(db)) return;
     pthread_mutex_lock(&db->write_mutex);
     for (size_t i = 0; i < db->num_snapshots; i++) {
         if (db->snapshots[i] == seq) {
@@ -93,6 +141,7 @@ void lsm_db_release_snapshot(lsm_db_t *db, uint64_t seq) {
         }
     }
     pthread_mutex_unlock(&db->write_mutex);
+    db_release_op(db);
 }
 
 static uint64_t get_oldest_snapshot(lsm_db_t *db) {
@@ -118,6 +167,7 @@ static void perform_flush_job(void *arg) {
     pthread_mutex_unlock(&db->state_mutex);
 
     if (!imm) {
+        db_release_job(db);
         lsm_db_release(db);
         return;
     }
@@ -135,8 +185,6 @@ static void perform_flush_job(void *arg) {
     sstable_builder_t *builder = sstable_builder_init(base_path, db->env->router.hot_vfs, FILTER_BLOOM, est_elements);
     sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
     meta->file_id = file_id;
-
-    // [Phase 5B] Initialize caching properties on fresh SSTables
     pthread_mutex_init(&meta->reader_mutex, NULL);
     meta->cached_reader = NULL;
 
@@ -199,12 +247,8 @@ static void perform_flush_job(void *arg) {
 
     lsm_version_t *v = lsmc_version_retain(db->manifest);
     int target_lvl = -1;
-    for (int i = 0; i < MAX_LEVELS - 1; i++) {
-        int limit = (i == 0) ? 4 : (10 * (1 << i));
-        if (v->levels[i].num_files >= (size_t)limit) {
-            target_lvl = i;
-            break;
-        }
+    if (v->compaction_score >= 1.0) {
+        target_lvl = v->compaction_level;
     }
     lsmc_version_release(db->manifest, v);
 
@@ -212,12 +256,21 @@ static void perform_flush_job(void *arg) {
         pthread_mutex_lock(&db->state_mutex);
         if (!db->is_compacting) {
             db->is_compacting = true;
-            lsm_db_retain(db);
-            lsm_pool_submit(db->env->bg_pool, perform_compaction_job, db, JOB_PRIORITY_HIGH);
+            db->active_jobs++;
+            db->owner_refs++;
+            if (!lsm_pool_submit(db->env->bg_pool, perform_compaction_job, db, JOB_PRIORITY_HIGH)) {
+                db->is_compacting = false;
+                db->active_jobs--;
+                db->owner_refs--;
+                if (db->closing && db->active_ops == 0 && db->active_jobs == 0) {
+                    pthread_cond_broadcast(&db->stall_cond);
+                }
+            }
         }
         pthread_mutex_unlock(&db->state_mutex);
     }
 
+    db_release_job(db);
     lsm_db_release(db);
 }
 
@@ -227,9 +280,9 @@ static void perform_compaction_job(void *arg) {
     while (true) {
         lsm_version_t *v = lsmc_version_retain(db->manifest);
         int target_lvl = -1;
-        for (int i = 0; i < MAX_LEVELS - 1; i++) {
-            int limit = (i == 0) ? 4 : (10 * (1 << i));
-            if (v->levels[i].num_files >= (size_t)limit) { target_lvl = i; break; }
+
+        if (v->compaction_score >= 1.0) {
+            target_lvl = v->compaction_level;
         }
         lsmc_version_release(db->manifest, v);
 
@@ -244,6 +297,7 @@ static void perform_compaction_job(void *arg) {
     pthread_cond_broadcast(&db->stall_cond);
     pthread_mutex_unlock(&db->state_mutex);
 
+    db_release_job(db);
     lsm_db_release(db);
 }
 
@@ -254,7 +308,11 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
     db->table_id = table_id;
     strncpy(db->db_dir, db_directory, sizeof(db->db_dir) - 1);
     db->db_dir[sizeof(db->db_dir) - 1] = '\0';
-    db->ref_count = 1;
+
+    db->owner_refs = 1;
+    db->active_ops = 0;
+    db->active_jobs = 0;
+    db->closing = false;
 
     db->manifest = lsmc_manifest_init(env, table_id, db_directory);
 
@@ -269,30 +327,37 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
     pthread_mutex_init(&db->state_mutex, NULL);
     pthread_mutex_init(&db->write_mutex, NULL);
     pthread_cond_init(&db->stall_cond, NULL);
+
+    db->writer_queue_head = NULL;
+    db->writer_queue_tail = NULL;
+
     db->is_flushing = false;
     db->is_compacting = false;
-    db->is_closing = false;
 
     lsm_env_register_db(env, db);
     return db;
 }
 
 void lsm_db_retain(lsm_db_t *db) {
-    if (db) __atomic_fetch_add(&db->ref_count, 1, __ATOMIC_SEQ_CST);
+    if (db) {
+        pthread_mutex_lock(&db->state_mutex);
+        db->owner_refs++;
+        pthread_mutex_unlock(&db->state_mutex);
+    }
 }
 
 void lsm_db_release(lsm_db_t *db) {
     if (!db) return;
-    int prev = __atomic_fetch_sub(&db->ref_count, 1, __ATOMIC_SEQ_CST);
 
-    if (prev == 2) {
-        pthread_mutex_lock(&db->state_mutex);
-        pthread_cond_broadcast(&db->stall_cond);
-        pthread_mutex_unlock(&db->state_mutex);
-    }
+    pthread_mutex_lock(&db->state_mutex);
+    int remaining = --db->owner_refs;
+    pthread_mutex_unlock(&db->state_mutex);
 
-    if (prev == 1) {
+    if (remaining == 0) {
         if (db->snapshots) aml_free(db->snapshots);
+        pthread_mutex_destroy(&db->state_mutex);
+        pthread_mutex_destroy(&db->write_mutex);
+        pthread_cond_destroy(&db->stall_cond);
         aml_free(db);
     }
 }
@@ -300,11 +365,19 @@ void lsm_db_release(lsm_db_t *db) {
 void lsm_db_close(lsm_db_t *db) {
     if (!db) return;
 
+    pthread_mutex_lock(&db->state_mutex);
+    if (db->closing) {
+        pthread_mutex_unlock(&db->state_mutex);
+        return;
+    }
+    db->closing = true;
+    pthread_mutex_unlock(&db->state_mutex);
+
     lsm_env_unregister_db(db->env, db);
 
+    // Wait for active users inside ops to drain
     pthread_mutex_lock(&db->state_mutex);
-    db->is_closing = true;
-    while (__atomic_load_n(&db->ref_count, __ATOMIC_SEQ_CST) > 1) {
+    while (db->active_ops > 0) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
     pthread_mutex_unlock(&db->state_mutex);
@@ -322,14 +395,28 @@ void lsm_db_close(lsm_db_t *db) {
 
         pthread_mutex_lock(&db->state_mutex);
         db->is_flushing = true;
-        lsm_db_retain(db);
-        lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT);
-        pthread_mutex_unlock(&db->state_mutex);
+        db->active_jobs++;
+        db->owner_refs++;
+        if (!lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT)) {
+            db->active_jobs--;
+            db->owner_refs--;
+            pthread_mutex_unlock(&db->state_mutex);
+
+            // Pool is shutting down, run final job synchronously
+            pthread_mutex_lock(&db->state_mutex);
+            db->active_jobs++;
+            db->owner_refs++;
+            pthread_mutex_unlock(&db->state_mutex);
+            perform_flush_job(db);
+        } else {
+            pthread_mutex_unlock(&db->state_mutex);
+        }
     }
     pthread_mutex_unlock(&db->write_mutex);
 
+    // Wait for all background jobs to finish (flush + any compactions it spawned)
     pthread_mutex_lock(&db->state_mutex);
-    while (db->imm_memtable != NULL || db->is_flushing || db->is_compacting) {
+    while (db->active_jobs > 0 || db->imm_memtable != NULL || db->is_flushing || db->is_compacting) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
     pthread_mutex_unlock(&db->state_mutex);
@@ -346,27 +433,32 @@ void lsm_db_close(lsm_db_t *db) {
             db->env->router.hot_vfs->close_writer(db->manifest->manifest_writer);
         }
 
+        for (int i = 0; i < MAX_LEVELS; i++) {
+            if (db->manifest->compaction_pointers[i]) {
+                aml_free(db->manifest->compaction_pointers[i]);
+            }
+        }
         pthread_mutex_destroy(&db->manifest->version_mutex);
         aml_free((void *)db->manifest->db_directory);
         aml_free(db->manifest);
     }
 
-    pthread_mutex_destroy(&db->write_mutex);
-    pthread_mutex_destroy(&db->state_mutex);
-    pthread_cond_destroy(&db->stall_cond);
-
+    // Drop the creation owner_ref
     lsm_db_release(db);
 }
 
 uint32_t lsm_db_get_table_id(lsm_db_t *db) { return db ? db->table_id : 0; }
 
 bool lsm_db_force_flush(lsm_db_t *db) {
+    if (!db_try_acquire_op(db)) return false;
+
     pthread_mutex_lock(&db->write_mutex);
     pthread_mutex_lock(&db->state_mutex);
 
     if (db->imm_memtable != NULL || memtable_first(db->memtable) == NULL) {
         pthread_mutex_unlock(&db->state_mutex);
         pthread_mutex_unlock(&db->write_mutex);
+        db_release_op(db);
         return false;
     }
 
@@ -381,26 +473,37 @@ bool lsm_db_force_flush(lsm_db_t *db) {
 
     if (!db->is_flushing) {
         db->is_flushing = true;
-        lsm_db_retain(db);
-        lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT);
+        db->active_jobs++;
+        db->owner_refs++;
+        if (!lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT)) {
+            db->is_flushing = false;
+            db->active_jobs--;
+            db->owner_refs--;
+            if (db->closing && db->active_ops == 0 && db->active_jobs == 0) {
+                pthread_cond_broadcast(&db->stall_cond);
+            }
+        }
     }
 
     pthread_mutex_unlock(&db->state_mutex);
     pthread_mutex_unlock(&db->write_mutex);
+
+    db_release_op(db);
     return true;
 }
 
 size_t lsm_db_get_active_mem_usage(lsm_db_t *db) {
+    if (!db_try_acquire_op(db)) return 0;
     pthread_mutex_lock(&db->write_mutex);
     size_t sz = memtable_get_memory_usage(db->memtable);
     pthread_mutex_unlock(&db->write_mutex);
+    db_release_op(db);
     return sz;
 }
 
 static bool stall_for_memory(lsm_env_t *env) {
     size_t usage = atomic_load(&env->global_mem_usage);
     size_t flush_limit = env->global_mem_limit;
-
     size_t soft_limit = (flush_limit * 8) / 10;
     size_t hard_stall_limit = flush_limit + (flush_limit / 2);
 
@@ -433,6 +536,7 @@ static bool stall_for_memory(lsm_env_t *env) {
 }
 
 void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
+    if (!db_try_acquire_op(db)) return;
     pthread_mutex_lock(&db->write_mutex);
     uint64_t seq = ++db->current_seq;
     size_t mem_before = memtable_get_memory_usage(db->memtable);
@@ -440,6 +544,7 @@ void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t 
     size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
     pthread_mutex_unlock(&db->write_mutex);
     atomic_fetch_add(&db->env->global_mem_usage, diff);
+    db_release_op(db);
 }
 
 // --- Write Batches ---
@@ -510,40 +615,78 @@ void lsm_write_batch_destroy(lsm_write_batch_t *b) {
 bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (!batch || batch->count == 0) return true;
 
-    pthread_mutex_lock(&db->state_mutex);
-    if (db->is_closing) {
-        pthread_mutex_unlock(&db->state_mutex);
-        return false;
-    }
-    pthread_mutex_unlock(&db->state_mutex);
-
+    if (!db_try_acquire_op(db)) return false;
     lsm_db_retain(db);
+
+    lsm_writer_t w;
+    w.batch = batch;
+    w.done = false;
+    w.success = false;
+    w.next = NULL;
+    pthread_cond_init(&w.cv, NULL);
+
     pthread_mutex_lock(&db->write_mutex);
 
+    if (db->writer_queue_tail) {
+        db->writer_queue_tail->next = &w;
+        db->writer_queue_tail = &w;
+    } else {
+        db->writer_queue_head = &w;
+        db->writer_queue_tail = &w;
+    }
+
+    while (!w.done && db->writer_queue_head != &w) {
+        pthread_cond_wait(&w.cv, &db->write_mutex);
+    }
+
+    if (w.done) {
+        pthread_mutex_unlock(&db->write_mutex);
+        pthread_cond_destroy(&w.cv);
+        db_release_op(db);
+        lsm_db_release(db);
+        return w.success;
+    }
+
+    // --- LEADER ---
+    lsm_writer_t *curr = db->writer_queue_head;
+    lsm_writer_t *last_writer = curr;
+    size_t total_count = 0;
+    uint32_t blob_size = 4;
+
+    while (curr != NULL) {
+        total_count += curr->batch->count;
+        for (size_t i = 0; i < curr->batch->count; i++) {
+            blob_size += 1 + 4 + 4 + curr->batch->entries[i].klen + curr->batch->entries[i].vlen;
+        }
+        last_writer = curr;
+        curr = curr->next;
+        if (blob_size > 1024 * 1024) break;
+    }
+
+    bool write_success = true;
     uint64_t start_seq = db->current_seq + 1;
-    db->current_seq += batch->count;
+    db->current_seq += total_count;
 
     if (db->env->global_wal && db->env->global_wal->append) {
-        uint32_t blob_size = 4;
-        for (size_t i = 0; i < batch->count; i++) {
-            blob_size += 1 + 4 + 4 + batch->entries[i].klen + batch->entries[i].vlen;
-        }
-
         uint8_t *blob = aml_malloc(blob_size);
         uint32_t ptr = 0;
-        encode_u32_le_db(blob + ptr, batch->count); ptr += 4;
+        encode_u32_le_db(blob + ptr, total_count); ptr += 4;
 
-        for (size_t i = 0; i < batch->count; i++) {
-            blob[ptr++] = batch->entries[i].type;
-            encode_u32_le_db(blob + ptr, batch->entries[i].klen); ptr += 4;
-            encode_u32_le_db(blob + ptr, batch->entries[i].vlen); ptr += 4;
+        curr = db->writer_queue_head;
+        while (curr != last_writer->next) {
+            for (size_t i = 0; i < curr->batch->count; i++) {
+                blob[ptr++] = curr->batch->entries[i].type;
+                encode_u32_le_db(blob + ptr, curr->batch->entries[i].klen); ptr += 4;
+                encode_u32_le_db(blob + ptr, curr->batch->entries[i].vlen); ptr += 4;
 
-            memcpy(blob + ptr, batch->entries[i].key, batch->entries[i].klen);
-            ptr += batch->entries[i].klen;
-            if (batch->entries[i].vlen > 0) {
-                memcpy(blob + ptr, batch->entries[i].val, batch->entries[i].vlen);
-                ptr += batch->entries[i].vlen;
+                memcpy(blob + ptr, curr->batch->entries[i].key, curr->batch->entries[i].klen);
+                ptr += curr->batch->entries[i].klen;
+                if (curr->batch->entries[i].vlen > 0) {
+                    memcpy(blob + ptr, curr->batch->entries[i].val, curr->batch->entries[i].vlen);
+                    ptr += curr->batch->entries[i].vlen;
+                }
             }
+            curr = curr->next;
         }
 
         db->env->global_wal->append(db->env->global_wal, db->table_id, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
@@ -551,20 +694,45 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     }
 
     size_t mem_before = memtable_get_memory_usage(db->memtable);
-    for(size_t i=0; i<batch->count; i++) {
-        memtable_put(db->memtable, start_seq + i, batch->entries[i].type,
-                     batch->entries[i].key, batch->entries[i].klen,
-                     batch->entries[i].val, batch->entries[i].vlen);
+    curr = db->writer_queue_head;
+    uint64_t seq = start_seq;
+
+    while (curr != last_writer->next) {
+        for (size_t i = 0; i < curr->batch->count; i++) {
+            memtable_put(db->memtable, seq++, curr->batch->entries[i].type,
+                         curr->batch->entries[i].key, curr->batch->entries[i].klen,
+                         curr->batch->entries[i].val, curr->batch->entries[i].vlen);
+        }
+        curr = curr->next;
     }
     size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
+
+    db->writer_queue_head = last_writer->next;
+    if (db->writer_queue_head == NULL) {
+        db->writer_queue_tail = NULL;
+    }
+
+    curr = &w;
+    while (curr != last_writer->next) {
+        curr->done = true;
+        curr->success = write_success;
+        if (curr != &w) {
+            pthread_cond_signal(&curr->cv);
+        }
+        curr = curr->next;
+    }
+
     pthread_mutex_unlock(&db->write_mutex);
 
     size_t current_usage = atomic_fetch_add(&db->env->global_mem_usage, diff) + diff;
     if (current_usage > db->env->global_mem_limit) lsm_db_force_flush(db);
 
-    bool success = stall_for_memory(db->env);
+    bool final_success = write_success && stall_for_memory(db->env);
+
+    pthread_cond_destroy(&w.cv);
+    db_release_op(db);
     lsm_db_release(db);
-    return success;
+    return final_success;
 }
 
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
@@ -585,7 +753,6 @@ bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
     return res;
 }
 
-// [Phase 5B Fix] Extracted helper utilizing lock-free reader caching
 static int check_sstable_for_get(lsm_db_t *db, sstable_meta_t *meta, int lvl, const void *key, uint32_t key_len, uint64_t read_seq_num, void **disk_val, uint32_t *local_vlen) {
     uint32_t umax = meta->max_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->max_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
     uint32_t umin = meta->min_key_len > INTERNAL_KEY_TRAILER_SIZE ? meta->min_key_len - INTERNAL_KEY_TRAILER_SIZE : 0;
@@ -600,7 +767,6 @@ static int check_sstable_for_get(lsm_db_t *db, sstable_meta_t *meta, int lvl, co
     if (cmp_max == 0) cmp_max = (key_len < umax) ? -1 : (key_len > umax ? 1 : 0);
     if (cmp_max > 0) return 0;
 
-    // Look for the cached reader. If missing, initialize it exactly once across all threads.
     sstable_reader_t *r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
     if (!r) {
         pthread_mutex_lock(&meta->reader_mutex);
@@ -616,21 +782,18 @@ static int check_sstable_for_get(lsm_db_t *db, sstable_meta_t *meta, int lvl, co
     }
     if (!r) return 0;
 
-    // Do NOT destroy 'r'. It lives as long as the sstable_meta_t lives!
     return sstable_reader_get(r, key, key_len, read_seq_num, disk_val, local_vlen);
 }
 
 void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_seq_num, uint32_t *out_val_len) {
-    pthread_mutex_lock(&db->state_mutex);
-    if (db->is_closing) {
-        pthread_mutex_unlock(&db->state_mutex);
-        return NULL;
-    }
-    pthread_mutex_unlock(&db->state_mutex);
-
+    if (!db_try_acquire_op(db)) return NULL;
     lsm_db_retain(db);
 
-    if (key_len > MAX_KEY_SIZE) { lsm_db_release(db); return NULL; }
+    if (key_len > MAX_KEY_SIZE) {
+        db_release_op(db);
+        lsm_db_release(db);
+        return NULL;
+    }
 
     uint32_t local_vlen = 0;
     if (out_val_len) *out_val_len = 0;
@@ -722,6 +885,7 @@ cleanup:
     memtable_release(active);
     if (imm) memtable_release(imm);
     lsmc_version_release(db->manifest, v);
+    db_release_op(db);
     lsm_db_release(db);
     return ret_val;
 }
@@ -813,13 +977,7 @@ static void advance_source(lsm_db_iter_t *it, iter_node_t *n) {
 }
 
 lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db, uint64_t read_seq_num) {
-    pthread_mutex_lock(&db->state_mutex);
-    if (db->is_closing) {
-        pthread_mutex_unlock(&db->state_mutex);
-        return NULL;
-    }
-    pthread_mutex_unlock(&db->state_mutex);
-
+    if (!db_try_acquire_op(db)) return NULL;
     lsm_db_retain(db);
 
     lsm_db_iter_t *it = aml_zalloc(sizeof(lsm_db_iter_t));
@@ -868,7 +1026,6 @@ lsm_db_iter_t *lsm_db_iter_init(lsm_db_t *db, uint64_t read_seq_num) {
         for (size_t f=0; f<it->version->levels[lvl].num_files; f++) {
             sstable_meta_t *meta = it->version->levels[lvl].files[f];
 
-            // [Phase 5B Fix] Cache utilization for iterators
             sstable_reader_t *r = __atomic_load_n(&meta->cached_reader, __ATOMIC_ACQUIRE);
             if (!r) {
                 pthread_mutex_lock(&meta->reader_mutex);
@@ -945,7 +1102,6 @@ void lsm_db_iter_destroy(lsm_db_iter_t *it) {
     if (!it) return;
     for (size_t i=0; i<it->num_files; i++) {
         sstable_iter_destroy(it->iters[i]);
-        // [Phase 5B Fix] Iterators no longer destroy the readers!
     }
     memtable_release(it->active);
     if (it->imm) memtable_release(it->imm);
@@ -953,6 +1109,22 @@ void lsm_db_iter_destroy(lsm_db_iter_t *it) {
 
     aml_free(it->ret_val_buf);
     aml_free(it->iters); aml_free(it->heap);
+
+    db_release_op(it->db);
     lsm_db_release(it->db);
     aml_free(it);
+}
+
+void lsm_db_debug_get_compaction_metrics(lsm_db_t *db, double *score, int *level, size_t *l0_files, size_t *l1_files) {
+    if (!db_try_acquire_op(db)) return;
+    if (db->manifest) {
+        pthread_mutex_lock(&db->manifest->version_mutex);
+        lsm_version_t *v = db->manifest->current_version;
+        if (score) *score = v->compaction_score;
+        if (level) *level = v->compaction_level;
+        if (l0_files) *l0_files = v->levels[0].num_files;
+        if (l1_files) *l1_files = v->levels[1].num_files;
+        pthread_mutex_unlock(&db->manifest->version_mutex);
+    }
+    db_release_op(db);
 }
