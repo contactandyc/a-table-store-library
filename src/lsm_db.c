@@ -75,7 +75,8 @@ struct lsm_db_s {
     size_t snapshots_cap;
 
     pthread_mutex_t state_mutex;
-    pthread_mutex_t write_mutex;
+    pthread_mutex_t write_mutex; // Protects actual WAL appending and MemTable updates
+    pthread_mutex_t queue_mutex; // ONLY protects Group Commit admission queue
     pthread_cond_t stall_cond;
 
     lsm_writer_t *writer_queue_head;
@@ -326,6 +327,7 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
 
     pthread_mutex_init(&db->state_mutex, NULL);
     pthread_mutex_init(&db->write_mutex, NULL);
+    pthread_mutex_init(&db->queue_mutex, NULL);
     pthread_cond_init(&db->stall_cond, NULL);
 
     db->writer_queue_head = NULL;
@@ -357,6 +359,7 @@ void lsm_db_release(lsm_db_t *db) {
         if (db->snapshots) aml_free(db->snapshots);
         pthread_mutex_destroy(&db->state_mutex);
         pthread_mutex_destroy(&db->write_mutex);
+        pthread_mutex_destroy(&db->queue_mutex);
         pthread_cond_destroy(&db->stall_cond);
         aml_free(db);
     }
@@ -501,7 +504,8 @@ size_t lsm_db_get_active_mem_usage(lsm_db_t *db) {
     return sz;
 }
 
-static bool stall_for_memory(lsm_env_t *env) {
+// Phase 2: Fair Backpressure is strictly post-commit.
+static void stall_for_memory(lsm_env_t *env) {
     size_t usage = atomic_load(&env->global_mem_usage);
     size_t flush_limit = env->global_mem_limit;
     size_t soft_limit = (flush_limit * 8) / 10;
@@ -509,22 +513,16 @@ static bool stall_for_memory(lsm_env_t *env) {
 
     if (usage > soft_limit) {
         if (usage > hard_stall_limit) {
-            bool stall_failed = false;
             pthread_mutex_lock(&env->global_mem_mutex);
-
             while (atomic_load(&env->global_mem_usage) > hard_stall_limit) {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
                 ts.tv_sec += 5;
-
-                int rc = pthread_cond_timedwait(&env->global_mem_cond, &env->global_mem_mutex, &ts);
-                if (rc != 0) {
-                    stall_failed = true;
+                if (pthread_cond_timedwait(&env->global_mem_cond, &env->global_mem_mutex, &ts) != 0) {
                     break;
                 }
             }
             pthread_mutex_unlock(&env->global_mem_mutex);
-            return !stall_failed;
         } else {
             size_t overage = usage - soft_limit;
             size_t band = hard_stall_limit - soft_limit;
@@ -532,13 +530,12 @@ static bool stall_for_memory(lsm_env_t *env) {
             usleep(delay);
         }
     }
-    return true;
 }
 
-void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
+void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
     if (!db_try_acquire_op(db)) return;
     pthread_mutex_lock(&db->write_mutex);
-    uint64_t seq = ++db->current_seq;
+    if (seq > db->current_seq) db->current_seq = seq;
     size_t mem_before = memtable_get_memory_usage(db->memtable);
     memtable_put(db->memtable, seq, op, key, klen, val, vlen);
     size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
@@ -570,34 +567,47 @@ lsm_write_batch_t *lsm_write_batch_init(void) {
 }
 
 bool lsm_write_batch_put(lsm_write_batch_t *b, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
-    if (klen > MAX_KEY_SIZE) return false;
+    if (!b || !key || klen == 0 || klen > MAX_KEY_SIZE) return false;
+    if (vlen > 0 && !val) return false;
+
     if (b->count == b->capacity) {
         b->capacity *= 2;
         b->entries = aml_realloc(b->entries, b->capacity * sizeof(lsm_batch_entry_t));
     }
     b->entries[b->count].type = OP_PUT;
+
     b->entries[b->count].key = aml_malloc(klen);
     memcpy(b->entries[b->count].key, key, klen);
     b->entries[b->count].klen = klen;
-    b->entries[b->count].val = aml_malloc(vlen);
-    memcpy(b->entries[b->count].val, val, vlen);
+
+    if (vlen > 0) {
+        b->entries[b->count].val = aml_malloc(vlen);
+        memcpy(b->entries[b->count].val, val, vlen);
+    } else {
+        b->entries[b->count].val = NULL;
+    }
     b->entries[b->count].vlen = vlen;
+
     b->count++;
     return true;
 }
 
 bool lsm_write_batch_delete(lsm_write_batch_t *b, const void *key, uint32_t klen) {
-    if (klen > MAX_KEY_SIZE) return false;
+    if (!b || !key || klen == 0 || klen > MAX_KEY_SIZE) return false;
+
     if (b->count == b->capacity) {
         b->capacity *= 2;
         b->entries = aml_realloc(b->entries, b->capacity * sizeof(lsm_batch_entry_t));
     }
     b->entries[b->count].type = OP_DELETE;
+
     b->entries[b->count].key = aml_malloc(klen);
     memcpy(b->entries[b->count].key, key, klen);
     b->entries[b->count].klen = klen;
+
     b->entries[b->count].val = NULL;
     b->entries[b->count].vlen = 0;
+
     b->count++;
     return true;
 }
@@ -612,6 +622,7 @@ void lsm_write_batch_destroy(lsm_write_batch_t *b) {
     aml_free(b);
 }
 
+// [Phase 2] Unblocked & Durable Group Commit Pipeline
 bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (!batch || batch->count == 0) return true;
 
@@ -625,7 +636,8 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     w.next = NULL;
     pthread_cond_init(&w.cv, NULL);
 
-    pthread_mutex_lock(&db->write_mutex);
+    // 1. Admission Control
+    pthread_mutex_lock(&db->queue_mutex);
 
     if (db->writer_queue_tail) {
         db->writer_queue_tail->next = &w;
@@ -636,51 +648,88 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     }
 
     while (!w.done && db->writer_queue_head != &w) {
-        pthread_cond_wait(&w.cv, &db->write_mutex);
+        pthread_cond_wait(&w.cv, &db->queue_mutex);
     }
 
+    // Follower completed via a leader
     if (w.done) {
-        pthread_mutex_unlock(&db->write_mutex);
+        pthread_mutex_unlock(&db->queue_mutex);
         pthread_cond_destroy(&w.cv);
+
+        bool succ = w.success;
+        lsm_env_t *env = db->env;
+
         db_release_op(db);
         lsm_db_release(db);
-        return w.success;
+
+        if (succ) stall_for_memory(env); // Enforce backpressure on followers!
+        return succ;
     }
 
     // --- LEADER ---
     lsm_writer_t *curr = db->writer_queue_head;
     lsm_writer_t *last_writer = curr;
     size_t total_count = 0;
-    uint32_t blob_size = 4;
+    uint32_t blob_size = 12; // 8 bytes start_seq + 4 bytes total_count
 
     while (curr != NULL) {
-        total_count += curr->batch->count;
+        uint32_t added_size = 0;
         for (size_t i = 0; i < curr->batch->count; i++) {
-            blob_size += 1 + 4 + 4 + curr->batch->entries[i].klen + curr->batch->entries[i].vlen;
+            added_size += 1 + 4 + 4 + curr->batch->entries[i].klen + curr->batch->entries[i].vlen;
         }
+        if (total_count > 0 && blob_size + added_size > 1024 * 1024) break;
+
+        blob_size += added_size;
+        total_count += curr->batch->count;
         last_writer = curr;
         curr = curr->next;
-        if (blob_size > 1024 * 1024) break;
     }
 
+    // 2. Detach Batch & Pass Baton
+    db->writer_queue_head = last_writer->next;
+    if (db->writer_queue_head == NULL) {
+        db->writer_queue_tail = NULL;
+    } else {
+        pthread_cond_signal(&db->writer_queue_head->cv); // Unblock the next queued writer immediately!
+    }
+
+    // Terminate our local batch list
+    last_writer->next = NULL;
+
+    pthread_mutex_unlock(&db->queue_mutex);
+
+    // 3. Serialize Atomic I/O
+    pthread_mutex_lock(&db->write_mutex);
+
     bool write_success = true;
-    uint64_t start_seq = db->current_seq + 1;
+    uint64_t start_seq = db->current_seq;
     db->current_seq += total_count;
 
     if (db->env->global_wal && db->env->global_wal->append) {
         uint8_t *blob = aml_malloc(blob_size);
         uint32_t ptr = 0;
+
+        // Encode strict sequence metadata directly into the blob so recovery matches perfectly
+        uint64_t wal_seq = start_seq + 1;
+        blob[0] = wal_seq & 0xFF; blob[1] = (wal_seq >> 8) & 0xFF;
+        blob[2] = (wal_seq >> 16) & 0xFF; blob[3] = (wal_seq >> 24) & 0xFF;
+        blob[4] = (wal_seq >> 32) & 0xFF; blob[5] = (wal_seq >> 40) & 0xFF;
+        blob[6] = (wal_seq >> 48) & 0xFF; blob[7] = (wal_seq >> 56) & 0xFF;
+        ptr += 8;
+
         encode_u32_le_db(blob + ptr, total_count); ptr += 4;
 
-        curr = db->writer_queue_head;
-        while (curr != last_writer->next) {
+        curr = &w;
+        while (curr != NULL) {
             for (size_t i = 0; i < curr->batch->count; i++) {
                 blob[ptr++] = curr->batch->entries[i].type;
                 encode_u32_le_db(blob + ptr, curr->batch->entries[i].klen); ptr += 4;
                 encode_u32_le_db(blob + ptr, curr->batch->entries[i].vlen); ptr += 4;
 
-                memcpy(blob + ptr, curr->batch->entries[i].key, curr->batch->entries[i].klen);
-                ptr += curr->batch->entries[i].klen;
+                if (curr->batch->entries[i].klen > 0) {
+                    memcpy(blob + ptr, curr->batch->entries[i].key, curr->batch->entries[i].klen);
+                    ptr += curr->batch->entries[i].klen;
+                }
                 if (curr->batch->entries[i].vlen > 0) {
                     memcpy(blob + ptr, curr->batch->entries[i].val, curr->batch->entries[i].vlen);
                     ptr += curr->batch->entries[i].vlen;
@@ -689,65 +738,82 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
             curr = curr->next;
         }
 
-        db->env->global_wal->append(db->env->global_wal, db->table_id, start_seq, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
+        write_success = db->env->global_wal->append(db->env->global_wal, db->table_id, wal_seq, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
         aml_free(blob);
     }
 
-    size_t mem_before = memtable_get_memory_usage(db->memtable);
-    curr = db->writer_queue_head;
-    uint64_t seq = start_seq;
+    size_t diff = 0;
+    if (write_success) {
+        size_t mem_before = memtable_get_memory_usage(db->memtable);
+        curr = &w;
+        uint64_t seq = start_seq;
 
-    while (curr != last_writer->next) {
-        for (size_t i = 0; i < curr->batch->count; i++) {
-            memtable_put(db->memtable, seq++, curr->batch->entries[i].type,
-                         curr->batch->entries[i].key, curr->batch->entries[i].klen,
-                         curr->batch->entries[i].val, curr->batch->entries[i].vlen);
+        while (curr != NULL) {
+            for (size_t i = 0; i < curr->batch->count; i++) {
+                memtable_put(db->memtable, ++seq, curr->batch->entries[i].type,
+                             curr->batch->entries[i].key, curr->batch->entries[i].klen,
+                             curr->batch->entries[i].val, curr->batch->entries[i].vlen);
+            }
+            curr = curr->next;
         }
-        curr = curr->next;
-    }
-    size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
-
-    db->writer_queue_head = last_writer->next;
-    if (db->writer_queue_head == NULL) {
-        db->writer_queue_tail = NULL;
-    }
-
-    curr = &w;
-    while (curr != last_writer->next) {
-        curr->done = true;
-        curr->success = write_success;
-        if (curr != &w) {
-            pthread_cond_signal(&curr->cv);
-        }
-        curr = curr->next;
+        diff = memtable_get_memory_usage(db->memtable) - mem_before;
+    } else {
+        // Rollback on failure
+        db->current_seq -= total_count;
     }
 
     pthread_mutex_unlock(&db->write_mutex);
 
-    size_t current_usage = atomic_fetch_add(&db->env->global_mem_usage, diff) + diff;
-    if (current_usage > db->env->global_mem_limit) lsm_db_force_flush(db);
+    // 4. Conclude the Batch
+    pthread_mutex_lock(&db->queue_mutex);
+    curr = w.next;
+    while (curr != NULL) {
+        lsm_writer_t *nxt = curr->next;
+        curr->success = write_success;
+        curr->done = true;
+        if (curr != &w) {
+            pthread_cond_signal(&curr->cv);
+        }
+        curr = nxt;
+    }
+    pthread_mutex_unlock(&db->queue_mutex);
 
-    bool final_success = write_success && stall_for_memory(db->env);
+    // 5. Memory Enforcer
+    if (write_success && diff > 0) {
+        size_t current_usage = atomic_fetch_add(&db->env->global_mem_usage, diff) + diff;
+        if (current_usage > db->env->global_mem_limit) lsm_db_force_flush(db);
+    }
 
     pthread_cond_destroy(&w.cv);
+    lsm_env_t *env = db->env;
+
     db_release_op(db);
     lsm_db_release(db);
-    return final_success;
+
+    if (write_success) stall_for_memory(env); // Leader pays stall tax too
+
+    return write_success; // Post-commit stall does NOT overwrite return value!
 }
 
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {
-    if (key_len > MAX_KEY_SIZE) return false;
+    if (!key || key_len == 0 || key_len > MAX_KEY_SIZE) return false;
     lsm_write_batch_t *b = lsm_write_batch_init();
-    lsm_write_batch_put(b, key, key_len, val, val_len);
+    if (!lsm_write_batch_put(b, key, key_len, val, val_len)) {
+        lsm_write_batch_destroy(b);
+        return false;
+    }
     bool res = lsm_db_write(db, b);
     lsm_write_batch_destroy(b);
     return res;
 }
 
 bool lsm_db_delete(lsm_db_t *db, const void *key, uint32_t key_len) {
-    if (key_len > MAX_KEY_SIZE) return false;
+    if (!key || key_len == 0 || key_len > MAX_KEY_SIZE) return false;
     lsm_write_batch_t *b = lsm_write_batch_init();
-    lsm_write_batch_delete(b, key, key_len);
+    if (!lsm_write_batch_delete(b, key, key_len)) {
+        lsm_write_batch_destroy(b);
+        return false;
+    }
     bool res = lsm_db_write(db, b);
     lsm_write_batch_destroy(b);
     return res;
@@ -789,7 +855,7 @@ void *lsm_db_get(lsm_db_t *db, const void *key, uint32_t key_len, uint64_t read_
     if (!db_try_acquire_op(db)) return NULL;
     lsm_db_retain(db);
 
-    if (key_len > MAX_KEY_SIZE) {
+    if (!key || key_len == 0 || key_len > MAX_KEY_SIZE) {
         db_release_op(db);
         lsm_db_release(db);
         return NULL;

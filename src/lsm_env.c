@@ -79,12 +79,12 @@ void lsm_env_enforce_memory_limit(lsm_env_t *env) {
     pthread_mutex_unlock(&env->env_mutex);
 
     if (largest_db) {
-        lsm_db_force_flush(largest_db); // Removed arbitrary 1MB threshold
+        lsm_db_force_flush(largest_db);
         lsm_db_release(largest_db);
     }
 }
 
-extern void lsm_db_inject_recovery(lsm_db_t *db, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen);
+extern void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen);
 
 static inline uint32_t dec_u32(const uint8_t *src) {
     return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
@@ -116,23 +116,38 @@ void lsm_env_recover_wal(lsm_env_t *env) {
         if (target_db) {
             if (op == 2 /* OP_BATCH */) {
                 const uint8_t *blob = (const uint8_t*)v;
-                if (vlen >= 4) {
-                    uint32_t count = dec_u32(blob);
-                    uint32_t ptr = 4;
-                    for (uint32_t c = 0; c < count && ptr < vlen; c++) {
-                        uint8_t b_op = blob[ptr++];
-                        if (ptr + 8 > vlen) break;
-                        uint32_t b_klen = dec_u32(blob + ptr); ptr += 4;
-                        uint32_t b_vlen = dec_u32(blob + ptr); ptr += 4;
-                        if (ptr + b_klen + b_vlen > vlen) break;
+                if (vlen >= 12) {
+                    uint64_t start_seq = ((uint64_t)blob[0]) | ((uint64_t)blob[1] << 8) | ((uint64_t)blob[2] << 16) | ((uint64_t)blob[3] << 24) |
+                                         ((uint64_t)blob[4] << 32) | ((uint64_t)blob[5] << 40) | ((uint64_t)blob[6] << 48) | ((uint64_t)blob[7] << 56);
+                    uint32_t count = dec_u32(blob + 8);
 
-                        const void *b_k = blob + ptr; ptr += b_klen;
-                        const void *b_v = blob + ptr; ptr += b_vlen;
-                        lsm_db_inject_recovery(target_db, b_op, b_k, b_klen, b_v, b_vlen);
+                    // Phase 3 Preview: Validate entire batch length boundaries BEFORE execution to prevent partial reloads
+                    bool valid = true;
+                    uint32_t check_ptr = 12;
+                    for (uint32_t c = 0; c < count; c++) {
+                        if (check_ptr + 9 > vlen) { valid = false; break; }
+                        check_ptr++; // skip op
+                        uint32_t b_klen = dec_u32(blob + check_ptr); check_ptr += 4;
+                        uint32_t b_vlen = dec_u32(blob + check_ptr); check_ptr += 4;
+                        // Prevent bounds/overflow exploits in malicious WALs
+                        if (check_ptr + b_klen + b_vlen > vlen || check_ptr + b_klen + b_vlen < check_ptr) { valid = false; break; }
+                        check_ptr += b_klen + b_vlen;
+                    }
+
+                    if (valid) {
+                        uint32_t ptr = 12;
+                        for (uint32_t c = 0; c < count; c++) {
+                            uint8_t b_op = blob[ptr++];
+                            uint32_t b_klen = dec_u32(blob + ptr); ptr += 4;
+                            uint32_t b_vlen = dec_u32(blob + ptr); ptr += 4;
+                            const void *b_k = (b_klen > 0) ? (blob + ptr) : NULL; ptr += b_klen;
+                            const void *b_v = (b_vlen > 0) ? (blob + ptr) : NULL; ptr += b_vlen;
+                            lsm_db_inject_recovery_seq(target_db, start_seq + c, b_op, b_k, b_klen, b_v, b_vlen);
+                        }
                     }
                 }
             } else {
-                lsm_db_inject_recovery(target_db, op, k, klen, v, vlen);
+                // Ignore non-batch ops because standard lsm_db_write exclusively creates batches
             }
             lsm_db_release(target_db);
         }
