@@ -126,6 +126,9 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         uint32_t record_len = decode_u32_le(len_buf);
         offset += 4;
 
+        // [Phase 3] Manifest size bounds checking (prevent memory attacks)
+        if (record_len < 16 || record_len > 16 * 1024 * 1024) break;
+
         uint8_t *buf = aml_malloc(record_len);
         if (m->env->router.hot_vfs->pread(reader, buf, record_len, offset) != record_len) {
             aml_free(buf); break;
@@ -146,7 +149,11 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         uint32_t tgt_lvl = decode_u32_le(buf + 4);
         uint32_t num_del = decode_u32_le(buf + 8);
         uint32_t num_add = decode_u32_le(buf + 12);
-        size_t ptr = 16;
+        uint64_t ptr = 16;
+
+        // [Phase 3] Guard against impossible file counts
+        if (num_del > 100000 || num_add > 100000) { aml_free(buf); break; }
+        if (ptr + (num_del * 8) > record_len) { aml_free(buf); break; }
 
         sstable_meta_t **d_files = NULL;
         if (num_del > 0) {
@@ -172,15 +179,19 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         }
 
         sstable_meta_t **a_files = NULL;
+        bool parse_failed = false;
+
         if (num_add > 0) {
             a_files = aml_malloc(num_add * sizeof(sstable_meta_t*));
             for (uint32_t a = 0; a < num_add; a++) {
+                // Minimum bytes required for a single file addition metadata structure (8+8+4+8 + 4 + 4 = 36)
+                if (ptr + 36 > record_len) { parse_failed = true; break; }
+
                 sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
                 a_files[a] = meta;
                 meta->ref_count = 0;
                 meta->is_obsolete = false;
 
-                // [Phase 5B Fix] Initialize caching fields for manifest-hydrated tables
                 pthread_mutex_init(&meta->reader_mutex, NULL);
                 meta->cached_reader = NULL;
 
@@ -190,10 +201,14 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
                 meta->max_seq = decode_u64_le(buf + ptr); ptr += 8;
 
                 meta->min_key_len = decode_u32_le(buf + ptr); ptr += 4;
+                if (ptr + meta->min_key_len + 4 > record_len) { parse_failed = true; break; }
+
                 meta->min_key = aml_malloc(meta->min_key_len);
                 memcpy(meta->min_key, buf + ptr, meta->min_key_len); ptr += meta->min_key_len;
 
                 meta->max_key_len = decode_u32_le(buf + ptr); ptr += 4;
+                if (ptr + meta->max_key_len > record_len) { parse_failed = true; break; }
+
                 meta->max_key = aml_malloc(meta->max_key_len);
                 memcpy(meta->max_key, buf + ptr, meta->max_key_len); ptr += meta->max_key_len;
 
@@ -201,6 +216,24 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
                     m->next_file_id = meta->file_id + 1;
                 }
             }
+        }
+
+        if (parse_failed) {
+            // Memory bounds hit: safely cleanup and abort parsing
+            if (d_files) aml_free(d_files);
+            if (a_files) {
+                for(uint32_t a=0; a<num_add; a++) {
+                    if(a_files[a]) {
+                        if(a_files[a]->min_key) aml_free(a_files[a]->min_key);
+                        if(a_files[a]->max_key) aml_free(a_files[a]->max_key);
+                        pthread_mutex_destroy(&a_files[a]->reader_mutex);
+                        aml_free(a_files[a]);
+                    }
+                }
+                aml_free(a_files);
+            }
+            aml_free(buf);
+            break;
         }
 
         lsmc_version_edit(m, src_lvl, tgt_lvl, d_files, num_del, a_files, num_add);

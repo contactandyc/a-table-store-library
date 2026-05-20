@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "a-table-store-library/pool_wal.h"
 #include "a-table-store-library/lsm_env.h"
 #include "a-table-store-library/lsm_db.h"
 #include "a-table-store-library/sstable_builder.h"
@@ -858,6 +859,59 @@ MACRO_TEST(db_group_commit_handles_concurrent_write_storms) {
     lsm_env_destroy(env);
 }
 
+static inline void encode_u32_le_test(uint8_t *dst, uint32_t v) {
+    dst[0] = v & 0xFF; dst[1] = (v >> 8) & 0xFF; dst[2] = (v >> 16) & 0xFF; dst[3] = (v >> 24) & 0xFF;
+}
+
+MACRO_TEST(db_wal_recovery_rejects_corrupted_batches) {
+    cleanup_db();
+
+    // Setup environment with a REAL pluggable WAL
+    lsm_wal_t *wal = pool_to_lsm_wal("/tmp/lsm_db_test_wal", 1, 2);
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, wal);
+
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+    lsm_db_put(db, "valid_key", 9, "valid_val", 9);
+
+    // Close cleanly without flushing so the record stays in the WAL
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+    // Now, intentionally forge a malicious WAL batch
+    pool_wal_t pool;
+    MACRO_ASSERT_EQ_INT(pool_wal_init(&pool, "/tmp/lsm_db_test_wal", 1, 2), 0);
+
+    uint8_t mal[21] = {0}; // 8 (seq) + 4 (count) + 1 (op) + 4 (klen) + 4 (vlen)
+    mal[0] = 10; // start_seq = 10
+    encode_u32_le_test(mal + 8, 1); // count = 1
+    mal[12] = 0; // OP_PUT
+    encode_u32_le_test(mal + 13, 0x7FFFFFFF); // MALICIOUS: Claim key is 2 Gigabytes!
+    encode_u32_le_test(mal + 17, 0); // vlen = 0
+
+    // Pass it to the underlying pool wal (simulating a corrupt disk write)
+    pool_wal_append(&pool, 2, 2 /* OP_BATCH */, mal, 21);
+    pool_wal_sync(&pool);
+    pool_wal_close(&pool);
+
+    // Reopen DB. lsm_env_recover_wal will run automatically.
+    lsm_wal_t *wal2 = pool_to_lsm_wal("/tmp/lsm_db_test_wal", 1, 2);
+    lsm_env_t *env2 = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                   &local_posix_backend, &local_posix_backend, 2, wal2);
+
+    lsm_db_t *db2 = lsm_db_open(env2, 1, "/tmp/lsm_db_test");
+    lsm_env_recover_wal(env2);
+
+    // ASSERTION: The environment did not crash!
+    // And the valid key is still recoverable.
+    uint32_t vlen;
+    char *v = lsm_db_get(db2, "valid_key", 9, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    aml_free(v);
+
+    lsm_db_close(db2);
+    lsm_env_destroy(env2);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -874,7 +928,6 @@ int main(void) {
     MACRO_ADD(tests, db_sequence_numbers_restore_correctly_on_restart);
     MACRO_ADD(tests, sstable_reader_defends_against_buffer_overflows);
 
-    // Phase 1 Additions
     MACRO_ADD(tests, db_env_destroy_avoids_teardown_deadlock);
     MACRO_ADD(tests, db_active_lease_prevents_premature_close);
 
@@ -885,6 +938,8 @@ int main(void) {
     MACRO_ADD(tests, db_sstable_reader_caching_and_cleanup);
     MACRO_ADD(tests, db_compaction_scoring_calculates_amplification);
     MACRO_ADD(tests, db_group_commit_handles_concurrent_write_storms);
+
+    MACRO_ADD(tests, db_wal_recovery_rejects_corrupted_batches);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

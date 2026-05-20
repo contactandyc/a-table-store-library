@@ -121,18 +121,21 @@ void lsm_env_recover_wal(lsm_env_t *env) {
                                          ((uint64_t)blob[4] << 32) | ((uint64_t)blob[5] << 40) | ((uint64_t)blob[6] << 48) | ((uint64_t)blob[7] << 56);
                     uint32_t count = dec_u32(blob + 8);
 
-                    // Phase 3 Preview: Validate entire batch length boundaries BEFORE execution to prevent partial reloads
+                    // [Phase 3] Secure parsing. Use uint64_t to prevent 32-bit math wraps.
                     bool valid = true;
-                    uint32_t check_ptr = 12;
+                    uint64_t check_ptr = 12;
                     for (uint32_t c = 0; c < count; c++) {
                         if (check_ptr + 9 > vlen) { valid = false; break; }
                         check_ptr++; // skip op
                         uint32_t b_klen = dec_u32(blob + check_ptr); check_ptr += 4;
                         uint32_t b_vlen = dec_u32(blob + check_ptr); check_ptr += 4;
-                        // Prevent bounds/overflow exploits in malicious WALs
-                        if (check_ptr + b_klen + b_vlen > vlen || check_ptr + b_klen + b_vlen < check_ptr) { valid = false; break; }
-                        check_ptr += b_klen + b_vlen;
+
+                        if (check_ptr + b_klen + (uint64_t)b_vlen > vlen) { valid = false; break; }
+                        check_ptr += b_klen + (uint64_t)b_vlen;
                     }
+
+                    // Strictly enforce that the parsed data size perfectly matches the frame size
+                    if (check_ptr != vlen) valid = false;
 
                     if (valid) {
                         uint32_t ptr = 12;
@@ -147,7 +150,7 @@ void lsm_env_recover_wal(lsm_env_t *env) {
                     }
                 }
             } else {
-                // Ignore non-batch ops because standard lsm_db_write exclusively creates batches
+                // Ignore non-batch ops
             }
             lsm_db_release(target_db);
         }
@@ -179,6 +182,10 @@ void lsm_env_destroy(lsm_env_t *env) {
 
     lsm_pool_destroy(env->bg_pool);
     lsm_cache_destroy(env->block_cache);
+
+    if (env->global_wal && env->global_wal->close) {
+        env->global_wal->close(env->global_wal);
+    }
 
     pthread_mutex_destroy(&env->global_mem_mutex);
     pthread_cond_destroy(&env->global_mem_cond);

@@ -1,5 +1,3 @@
-Here is a comprehensive summary of everything we accomplished in Phases 1 and 2. We successfully transitioned the engine from a prototype into a thread-safe, high-throughput system capable of handling extreme concurrency and power-loss recovery.
-
 ### Phase 1: Object Lifecycle & Concurrency Hardening
 
 This phase focused on eliminating Time-of-Check to Time-of-Use (TOCTOU) races, use-after-free vulnerabilities, and recursive deadlocks during database teardown.
@@ -21,16 +19,15 @@ This phase focused on unblocking the I/O pipeline, guaranteeing write durability
 * **Pluggable `pool_wal` Integration:** Replaced the generic WAL stub with the native `pool_wal_t` engine. We embedded the `pool_to_lsm_wal` translation layer directly into the WAL library, creating a bridge that securely multiplexes `table_id` tracking and safely coordinates garbage collection (purging) across multiple active databases.
 * **Sequence Metadata Embedding & Pull Iteration:** Injected explicit 8-byte sequence metadata (`start_seq` and `total_count`) into the binary WAL payloads. Transitioned the WAL replay system from a callback model to a native pull-based iterator (`pool_wal_iter_t`) to seamlessly align with the LSM environment's multi-table recovery logic.
 
-### Phase 3: Harden Recovery and Disk Parsing
+### Phase 3: Hardware Resilience & Parser Hardening
 
-This phase ensures the database cannot be crashed or exploited by corrupted, torn, or malicious disk data.
+This phase armored the boundary between the OS file system and our in-memory pointers, ensuring the database gracefully rejects corrupted, torn, or maliciously fuzzed disk data without crashing, hanging, or exhausting memory.
 
-* **WAL Validation:** Parse and validate entire WAL batches before replaying them. If a batch is malformed, reject it entirely rather than applying a partial prefix.
-* **Manifest Caps:** Add strict record size caps and per-field bounds checks during manifest replay.
-* **SSTable Bounds Checks:** Enforce rigid bounds checks for SSTable metadata and index parsing (e.g., ensuring `idx->size >= 9` and `block_size >= 4`).
-* **Secure Decompression:** Verify the restart-table, compression-flag, CRC, and decompression sizes safely before acting on the data.
-* **Bitmap Filter Fix:** Correct the bitmap filter so that out-of-range queries are treated as a "maybe" (proceeding to the index) rather than a false negative.
-* **Cache Pointer Safety:** Replace the iterator's unsafe `uint64_t cached_offset` cast with a strongly typed `lsm_cache_handle_t *` pointer.
+* **Strict WAL Frame Validation:** Upgraded the WAL replay engine (`lsm_env_recover_wal`) to utilize 64-bit integer math to prevent 32-bit overflow exploits. The parser now validates the internal boundaries of an entire batch—ensuring all key and value lengths perfectly match the total payload size—before attempting to apply a single record to the MemTable.
+* **Manifest Allocation Limits:** Guarded `replay_manifest` against Out-Of-Memory (OOM) attacks caused by corrupted version edits. Added rigid bounds checks, capped single record sizes at 16MB, and limited file deletions/additions to 100,000 per edit to prevent infinite allocation loops on bad disk sectors.
+* **SSTable Block Underflow Protection:** Hardened the SSTable reader and iterator against malformed data blocks. Enforced minimum index entry sizes (`>= 9` bytes) and uncompressed block sizes (`>= 4` bytes), and added strict mathematical checks against `num_restarts` to completely eliminate silent buffer underflows and out-of-bounds memory reads.
+* **Bitmap Filter False-Negative Resolution:** Fixed a critical data-loss vulnerability where integer keys exceeding the builder's dynamic bitmap capacity were falsely reported as "Not Found" by the reader. The reader now treats out-of-bounds bitmap queries as a "maybe" and correctly falls back to a deterministic index search.
+* **Strongly-Typed Cache Pointers:** Eliminated the unsafe `uint64_t` integer casting used to track memory offsets inside the SSTable iterator. Replaced it with a strongly-typed `lsm_cache_handle_t *` pointer to guarantee safe reference counting and prevent Use-After-Free (UAF) crashes during block transitions.
 
 ### Phase 4: Make Flush/Compaction Transactional
 
