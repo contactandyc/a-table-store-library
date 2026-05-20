@@ -69,15 +69,24 @@ struct lsm_db_s {
     uint64_t current_seq;
     uint64_t imm_seq;
 
+    // [Phase 6] Global LSN Tracking for Safe GC
+    uint64_t current_wal_lsn;
+    uint64_t imm_wal_lsn;
+
     // Snapshot tracking
     uint64_t *snapshots;
     size_t num_snapshots;
     size_t snapshots_cap;
 
     pthread_mutex_t state_mutex;
-    pthread_mutex_t write_mutex; // Protects actual WAL appending and MemTable updates
-    pthread_mutex_t queue_mutex; // ONLY protects Group Commit admission queue
+    pthread_mutex_t write_mutex;
+    pthread_mutex_t queue_mutex;
     pthread_cond_t stall_cond;
+
+    // [Phase 6] Strict Commit Ordering Tickets
+    uint64_t commit_ticket_head;
+    uint64_t commit_ticket_tail;
+    pthread_cond_t commit_cv;
 
     lsm_writer_t *writer_queue_head;
     lsm_writer_t *writer_queue_tail;
@@ -164,7 +173,7 @@ static void perform_flush_job(void *arg) {
     pthread_mutex_lock(&db->state_mutex);
     memtable_t *imm = db->imm_memtable;
     if (imm) memtable_retain(imm);
-    uint64_t flushed_seq = db->imm_seq;
+    uint64_t flushed_lsn = db->imm_wal_lsn; // [Phase 6] Target the LSN
     pthread_mutex_unlock(&db->state_mutex);
 
     if (!imm) {
@@ -193,7 +202,7 @@ static void perform_flush_job(void *arg) {
     memtable_row_t *row = memtable_first(imm);
     char ikey[MAX_INTERNAL_KEY_SIZE];
     uint64_t block_max_seq = 0;
-    bool io_error = false; // [Phase 4] Track I/O errors
+    bool io_error = false;
 
     while (row) {
         uint32_t klen, vlen;
@@ -235,14 +244,12 @@ static void perform_flush_job(void *arg) {
         sstable_builder_abort(builder);
     }
 
-    // [Phase 4] Fail-safe backoff on I/O error
     if (io_error) {
         if (meta->min_key) aml_free(meta->min_key);
         if (meta->max_key) aml_free(meta->max_key);
         pthread_mutex_destroy(&meta->reader_mutex);
         aml_free(meta);
 
-        // Relinquish the state lock and leave data in imm_memtable so it safely retries later
         pthread_mutex_lock(&db->state_mutex);
         db->is_flushing = false;
         pthread_cond_broadcast(&db->stall_cond);
@@ -256,7 +263,6 @@ static void perform_flush_job(void *arg) {
 
     sstable_meta_t *added[1] = { meta };
 
-    // [Phase 4] Enforce manifest atomicity before checkpointing
     if (!lsmc_version_edit(db->manifest, -1, 0, NULL, 0, added, 1)) {
         char dp[520]; snprintf(dp, 520, "%s.data", base_path); db->env->router.hot_vfs->delete_file(dp);
         char mp[520]; snprintf(mp, 520, "%s.meta", base_path); db->env->router.hot_vfs->delete_file(mp);
@@ -277,9 +283,9 @@ static void perform_flush_job(void *arg) {
         return;
     }
 
-    // [Phase 4] DELAYED CHECKPOINT: Only purge the WAL *after* the MemTable is securely durable in Manifest!
-    if (db->env->global_wal && db->env->global_wal->checkpoint) {
-        db->env->global_wal->checkpoint(db->env->global_wal, db->table_id, flushed_seq);
+    // [Phase 6] DELAYED CHECKPOINT: Use global flushed LSN
+    if (db->env->global_wal && db->env->global_wal->checkpoint && flushed_lsn > 0) {
+        db->env->global_wal->checkpoint(db->env->global_wal, db->table_id, flushed_lsn);
     }
 
     pthread_mutex_lock(&db->state_mutex);
@@ -343,8 +349,7 @@ static void perform_compaction_job(void *arg) {
 
         uint64_t oldest_snap = get_oldest_snapshot(db);
         if (!lsmc_compact_level(db->manifest, target_lvl, oldest_snap)) {
-            // Compaction Backoff: Safely halt loop on I/O error so we don't infinitely spin CPU
-            usleep(1000 * 1000); // Wait 1 second before allowing retry
+            usleep(1000 * 1000);
             break;
         }
     }
@@ -376,6 +381,13 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
     uint64_t max_seq = lsmc_get_max_sequence(db->manifest);
     db->current_seq = max_seq > 0 ? max_seq : 1;
     db->imm_seq = 0;
+
+    // [Phase 6] Init Ticket Dispenser
+    db->commit_ticket_head = 0;
+    db->commit_ticket_tail = 0;
+    pthread_cond_init(&db->commit_cv, NULL);
+    db->current_wal_lsn = 0;
+    db->imm_wal_lsn = 0;
 
     db->memtable = memtable_init();
     atomic_fetch_add(&env->global_mem_usage, memtable_get_memory_usage(db->memtable));
@@ -417,6 +429,7 @@ void lsm_db_release(lsm_db_t *db) {
         pthread_mutex_destroy(&db->write_mutex);
         pthread_mutex_destroy(&db->queue_mutex);
         pthread_cond_destroy(&db->stall_cond);
+        pthread_cond_destroy(&db->commit_cv); // [Phase 6]
         aml_free(db);
     }
 }
@@ -434,14 +447,16 @@ void lsm_db_close(lsm_db_t *db) {
 
     lsm_env_unregister_db(db->env, db);
 
-    // Wait for active users inside ops to drain
+    // [Phase 6] Unregister table so it stops blocking global WAL GC
+    if (db->env->global_wal && db->env->global_wal->unregister_table) {
+        db->env->global_wal->unregister_table(db->env->global_wal, db->table_id);
+    }
+
     pthread_mutex_lock(&db->state_mutex);
     while (db->active_ops > 0) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
 
-    // [Phase 4 Fix] Wait for any active background flush to finish or fail
-    // before we try to touch imm_memtable.
     while (db->is_flushing) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
@@ -449,8 +464,6 @@ void lsm_db_close(lsm_db_t *db) {
 
     pthread_mutex_lock(&db->write_mutex);
 
-    // [Phase 4 Fix] If a previous disk error stranded data here, safely drop it.
-    // The WAL acts as the ultimate source of truth and will recover it perfectly on next startup!
     if (db->imm_memtable != NULL) {
         atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->imm_memtable));
         memtable_release(db->imm_memtable);
@@ -460,6 +473,8 @@ void lsm_db_close(lsm_db_t *db) {
     if (memtable_first(db->memtable)) {
         db->imm_memtable = db->memtable;
         db->imm_seq = db->current_seq;
+        db->imm_wal_lsn = db->current_wal_lsn; // [Phase 6] Transfer LSN identity
+
         db->memtable = memtable_init();
         atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
 
@@ -476,7 +491,6 @@ void lsm_db_close(lsm_db_t *db) {
             db->owner_refs--;
             pthread_mutex_unlock(&db->state_mutex);
 
-            // Pool is shutting down, run final job synchronously
             pthread_mutex_lock(&db->state_mutex);
             db->active_jobs++;
             db->owner_refs++;
@@ -488,17 +502,12 @@ void lsm_db_close(lsm_db_t *db) {
     }
     pthread_mutex_unlock(&db->write_mutex);
 
-    // Wait for all background jobs to finish (flush + any compactions it spawned)
     pthread_mutex_lock(&db->state_mutex);
 
-    // NOTE: We no longer wait for `db->imm_memtable != NULL` here.
-    // We only wait for the active_jobs/flushing flags to clear.
     while (db->active_jobs > 0 || db->is_flushing || db->is_compacting) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
 
-    // [Phase 4 Fix] If the final flush ALSO failed due to a disk error, safely drop it now.
-    // This prevents the shutdown sequence from deadlocking.
     if (db->imm_memtable != NULL) {
         atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->imm_memtable));
         memtable_release(db->imm_memtable);
@@ -528,7 +537,6 @@ void lsm_db_close(lsm_db_t *db) {
         aml_free(db->manifest);
     }
 
-    // Drop the creation owner_ref
     lsm_db_release(db);
 }
 
@@ -549,6 +557,8 @@ bool lsm_db_force_flush(lsm_db_t *db) {
 
     db->imm_memtable = db->memtable;
     db->imm_seq = db->current_seq;
+    db->imm_wal_lsn = db->current_wal_lsn; // [Phase 6]
+
     db->memtable = memtable_init();
     atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
 
@@ -586,7 +596,6 @@ size_t lsm_db_get_active_mem_usage(lsm_db_t *db) {
     return sz;
 }
 
-// Phase 2: Fair Backpressure is strictly post-commit.
 static void stall_for_memory(lsm_env_t *env) {
     size_t usage = atomic_load(&env->global_mem_usage);
     size_t flush_limit = env->global_mem_limit;
@@ -614,10 +623,12 @@ static void stall_for_memory(lsm_env_t *env) {
     }
 }
 
-void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
+// [Phase 6] Track LSN on recovery
+void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint64_t lsn, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
     if (!db_try_acquire_op(db)) return;
     pthread_mutex_lock(&db->write_mutex);
     if (seq > db->current_seq) db->current_seq = seq;
+    if (lsn > db->current_wal_lsn) db->current_wal_lsn = lsn;
     size_t mem_before = memtable_get_memory_usage(db->memtable);
     memtable_put(db->memtable, seq, op, key, klen, val, vlen);
     size_t diff = memtable_get_memory_usage(db->memtable) - mem_before;
@@ -626,7 +637,6 @@ void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint8_t op, const vo
     db_release_op(db);
 }
 
-// --- Write Batches ---
 typedef struct {
     uint8_t type;
     void *key;
@@ -704,7 +714,7 @@ void lsm_write_batch_destroy(lsm_write_batch_t *b) {
     aml_free(b);
 }
 
-// [Phase 2] Unblocked & Durable Group Commit Pipeline
+// [Phase 6] Strictly Ticketed Group Commit Pipeline
 bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (!batch || batch->count == 0) return true;
 
@@ -721,11 +731,14 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     // 1. Admission Control
     pthread_mutex_lock(&db->queue_mutex);
 
-    if (db->writer_queue_tail) {
-        db->writer_queue_tail->next = &w;
+    bool is_leader = (db->writer_queue_head == NULL);
+    uint64_t my_ticket = 0;
+
+    if (is_leader) {
+        db->writer_queue_head = &w;
         db->writer_queue_tail = &w;
     } else {
-        db->writer_queue_head = &w;
+        db->writer_queue_tail->next = &w;
         db->writer_queue_tail = &w;
     }
 
@@ -733,26 +746,25 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
         pthread_cond_wait(&w.cv, &db->queue_mutex);
     }
 
-    // Follower completed via a leader
     if (w.done) {
         pthread_mutex_unlock(&db->queue_mutex);
         pthread_cond_destroy(&w.cv);
-
         bool succ = w.success;
         lsm_env_t *env = db->env;
-
         db_release_op(db);
         lsm_db_release(db);
-
-        if (succ) stall_for_memory(env); // Enforce backpressure on followers!
+        if (succ) stall_for_memory(env);
         return succ;
     }
 
     // --- LEADER ---
+    // [Phase 6] Draw ticket immediately before detaching the queue
+    my_ticket = db->commit_ticket_head++;
+
     lsm_writer_t *curr = db->writer_queue_head;
     lsm_writer_t *last_writer = curr;
     size_t total_count = 0;
-    uint32_t blob_size = 12; // 8 bytes start_seq + 4 bytes total_count
+    uint32_t blob_size = 12;
 
     while (curr != NULL) {
         uint32_t added_size = 0;
@@ -772,26 +784,29 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (db->writer_queue_head == NULL) {
         db->writer_queue_tail = NULL;
     } else {
-        pthread_cond_signal(&db->writer_queue_head->cv); // Unblock the next queued writer immediately!
+        pthread_cond_signal(&db->writer_queue_head->cv);
     }
 
-    // Terminate our local batch list
     last_writer->next = NULL;
-
     pthread_mutex_unlock(&db->queue_mutex);
 
-    // 3. Serialize Atomic I/O
+    // [Phase 6] 3. Serialize Atomic I/O By Ticket Order
     pthread_mutex_lock(&db->write_mutex);
+
+    // Do not proceed until it is strictly this batch's turn
+    while (db->commit_ticket_tail != my_ticket) {
+        pthread_cond_wait(&db->commit_cv, &db->write_mutex);
+    }
 
     bool write_success = true;
     uint64_t start_seq = db->current_seq;
     db->current_seq += total_count;
+    uint64_t assigned_lsn = 0;
 
     if (db->env->global_wal && db->env->global_wal->append) {
         uint8_t *blob = aml_malloc(blob_size);
         uint32_t ptr = 0;
 
-        // Encode strict sequence metadata directly into the blob so recovery matches perfectly
         uint64_t wal_seq = start_seq + 1;
         blob[0] = wal_seq & 0xFF; blob[1] = (wal_seq >> 8) & 0xFF;
         blob[2] = (wal_seq >> 16) & 0xFF; blob[3] = (wal_seq >> 24) & 0xFF;
@@ -820,12 +835,19 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
             curr = curr->next;
         }
 
-        write_success = db->env->global_wal->append(db->env->global_wal, db->table_id, wal_seq, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
+        // [Phase 6] Capture the assigned LSN
+        if (!db->env->global_wal->append(db->env->global_wal, db->table_id, wal_seq, 2 /* OP_BATCH */, NULL, 0, blob, blob_size, &assigned_lsn)) {
+            write_success = false;
+        }
         aml_free(blob);
     }
 
     size_t diff = 0;
     if (write_success) {
+        if (assigned_lsn > db->current_wal_lsn) {
+            db->current_wal_lsn = assigned_lsn; // Advance tracked LSN
+        }
+
         size_t mem_before = memtable_get_memory_usage(db->memtable);
         curr = &w;
         uint64_t seq = start_seq;
@@ -840,9 +862,12 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
         }
         diff = memtable_get_memory_usage(db->memtable) - mem_before;
     } else {
-        // Rollback on failure
         db->current_seq -= total_count;
     }
+
+    // [Phase 6] Ticket complete. Allow the next chronological batch to proceed.
+    db->commit_ticket_tail++;
+    pthread_cond_broadcast(&db->commit_cv);
 
     pthread_mutex_unlock(&db->write_mutex);
 
@@ -872,9 +897,9 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     db_release_op(db);
     lsm_db_release(db);
 
-    if (write_success) stall_for_memory(env); // Leader pays stall tax too
+    if (write_success) stall_for_memory(env);
 
-    return write_success; // Post-commit stall does NOT overwrite return value!
+    return write_success;
 }
 
 bool lsm_db_put(lsm_db_t *db, const void *key, uint32_t key_len, const void *val, uint32_t val_len) {

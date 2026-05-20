@@ -84,7 +84,8 @@ void lsm_env_enforce_memory_limit(lsm_env_t *env) {
     }
 }
 
-extern void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen);
+// [Phase 6 Fix] Added LSN
+extern void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint64_t lsn, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen);
 
 static inline uint32_t dec_u32(const uint8_t *src) {
     return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
@@ -100,8 +101,10 @@ void lsm_env_recover_wal(lsm_env_t *env) {
     uint8_t op;
     const void *k, *v;
     uint32_t klen, vlen;
+    uint64_t lsn;
 
-    while (iter->next(iter, &table_id, &op, &k, &klen, &v, &vlen)) {
+    // [Phase 6 Fix] Read LSN from iterator
+    while (iter->next(iter, &table_id, &lsn, &op, &k, &klen, &v, &vlen)) {
         lsm_db_t *target_db = NULL;
         pthread_mutex_lock(&env->env_mutex);
         for (size_t i = 0; i < env->num_tables; i++) {
@@ -121,7 +124,6 @@ void lsm_env_recover_wal(lsm_env_t *env) {
                                          ((uint64_t)blob[4] << 32) | ((uint64_t)blob[5] << 40) | ((uint64_t)blob[6] << 48) | ((uint64_t)blob[7] << 56);
                     uint32_t count = dec_u32(blob + 8);
 
-                    // [Phase 3] Secure parsing. Use uint64_t to prevent 32-bit math wraps.
                     bool valid = true;
                     uint64_t check_ptr = 12;
                     for (uint32_t c = 0; c < count; c++) {
@@ -134,7 +136,6 @@ void lsm_env_recover_wal(lsm_env_t *env) {
                         check_ptr += b_klen + (uint64_t)b_vlen;
                     }
 
-                    // Strictly enforce that the parsed data size perfectly matches the frame size
                     if (check_ptr != vlen) valid = false;
 
                     if (valid) {
@@ -145,12 +146,10 @@ void lsm_env_recover_wal(lsm_env_t *env) {
                             uint32_t b_vlen = dec_u32(blob + ptr); ptr += 4;
                             const void *b_k = (b_klen > 0) ? (blob + ptr) : NULL; ptr += b_klen;
                             const void *b_v = (b_vlen > 0) ? (blob + ptr) : NULL; ptr += b_vlen;
-                            lsm_db_inject_recovery_seq(target_db, start_seq + c, b_op, b_k, b_klen, b_v, b_vlen);
+                            lsm_db_inject_recovery_seq(target_db, start_seq + c, lsn, b_op, b_k, b_klen, b_v, b_vlen);
                         }
                     }
                 }
-            } else {
-                // Ignore non-batch ops
             }
             lsm_db_release(target_db);
         }

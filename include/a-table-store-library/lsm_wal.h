@@ -18,7 +18,7 @@ struct lsm_wal_iter_s {
     void *ctx;
 
     /* Returns false when the log is fully read or a torn/corrupted write is hit */
-    bool (*next)(lsm_wal_iter_t *iter, uint32_t *out_table_id, uint8_t *out_op,
+    bool (*next)(lsm_wal_iter_t *iter, uint32_t *out_table_id, uint64_t *out_lsn, uint8_t *out_op,
                  const void **out_key, uint32_t *out_klen,
                  const void **out_val, uint32_t *out_vlen);
 
@@ -29,16 +29,19 @@ struct lsm_wal_iter_s {
 struct lsm_wal_s {
     void *ctx;
 
-    /* Append a multiplexed record to the log. Added seq_num for tight integration. */
+    /* [Phase 6 Fix] Append yields the assigned Global LSN, returns false on I/O failure */
     bool (*append)(lsm_wal_t *wal, uint32_t table_id, uint64_t seq_num, uint8_t op,
                    const void *key, uint32_t klen,
-                   const void *val, uint32_t vlen);
+                   const void *val, uint32_t vlen, uint64_t *out_lsn);
 
     /* Force the OS to flush the log to physical media (fsync / O_DSYNC) */
     void (*sync)(lsm_wal_t *wal);
 
-    /* Signal that all records for 'table_id' up to 'seq_num' are durable in SSTables */
-    void (*checkpoint)(lsm_wal_t *wal, uint32_t table_id, uint64_t seq_num);
+    /* [Phase 6 Fix] Signal that all records up to 'lsn' are durable in SSTables */
+    void (*checkpoint)(lsm_wal_t *wal, uint32_t table_id, uint64_t lsn);
+
+    /* [Phase 6 Fix] Unregister a table to allow GC to proceed without it */
+    void (*unregister_table)(lsm_wal_t *wal, uint32_t table_id);
 
     /* Safely close the WAL */
     void (*close)(lsm_wal_t *wal);

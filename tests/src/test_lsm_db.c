@@ -17,27 +17,31 @@
 #include "the-macro-library/macro_test.h"
 
 static void cleanup_db() {
-    system("rm -rf /tmp/lsm_db_test");
-    system("mkdir -p /tmp/lsm_db_test");
+    system("rm -rf /tmp/lsm_db_test /tmp/lsm_db_test_wal");
+    system("mkdir -p /tmp/lsm_db_test /tmp/lsm_db_test_wal");
 }
 
 // --- MOCK WAL FOR CHECKPOINT TESTING ---
-static uint64_t last_checkpoint_seq = 0;
+static uint64_t last_checkpoint_lsn = 0;
 static uint32_t last_checkpoint_table = 0;
 static bool wal_checkpoint_called = false;
 
-static void mock_wal_checkpoint(lsm_wal_t *wal, uint32_t table_id, uint64_t seq_num) {
+static void mock_wal_checkpoint(lsm_wal_t *wal, uint32_t table_id, uint64_t lsn) {
     (void)wal;
     last_checkpoint_table = table_id;
-    last_checkpoint_seq = seq_num;
+    last_checkpoint_lsn = lsn;
     wal_checkpoint_called = true;
 }
-static bool mock_wal_append(lsm_wal_t *w, uint32_t t, uint64_t s, uint8_t o, const void *k, uint32_t kl, const void *v, uint32_t vl) {
-    (void)w; (void)t; (void)s; (void)o; (void)k; (void)kl; (void)v; (void)vl;
+
+// [Phase 6 Fix] Returns bool and yields LSN
+static bool mock_wal_append(lsm_wal_t *w, uint32_t t, uint64_t s, uint8_t o, const void *k, uint32_t kl, const void *v, uint32_t vl, uint64_t *out_lsn) {
+    (void)w; (void)t; (void)o; (void)k; (void)kl; (void)v; (void)vl;
+    if (out_lsn) *out_lsn = s; // Mock returns sequence as an arbitrary pseudo-LSN
     return true;
 }
 
 static void mock_wal_sync(lsm_wal_t *w) { (void)w; }
+static void mock_wal_unregister(lsm_wal_t *w, uint32_t t) { (void)w; (void)t; }
 static void mock_wal_close(lsm_wal_t *w) { (void)w; }
 static lsm_wal_iter_t* mock_wal_iter_init(lsm_wal_t *w) { (void)w; return NULL; }
 
@@ -46,6 +50,7 @@ static lsm_wal_t mock_wal = {
     .append = mock_wal_append,
     .sync = mock_wal_sync,
     .checkpoint = mock_wal_checkpoint,
+    .unregister_table = mock_wal_unregister,
     .close = mock_wal_close,
     .iter_init = mock_wal_iter_init
 };
@@ -136,7 +141,7 @@ MACRO_TEST(db_iterator_merges_memory_and_disk_safely) {
 MACRO_TEST(db_wal_checkpoint_triggered_on_flush) {
     cleanup_db();
     wal_checkpoint_called = false;
-    last_checkpoint_seq = 0;
+    last_checkpoint_lsn = 0; // [Phase 6 Fix] Uses LSN
     last_checkpoint_table = 0;
 
     lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
@@ -151,11 +156,12 @@ MACRO_TEST(db_wal_checkpoint_triggered_on_flush) {
 
     MACRO_ASSERT_TRUE(wal_checkpoint_called);
     MACRO_ASSERT_EQ_INT(last_checkpoint_table, 42);
-    MACRO_ASSERT_TRUE(last_checkpoint_seq >= 2);
+    MACRO_ASSERT_TRUE(last_checkpoint_lsn >= 2); // [Phase 6 Fix] Uses LSN
 
     lsm_db_close(db);
     lsm_env_destroy(env);
 }
+
 
 MACRO_TEST(db_memory_limit_triggers_stall_and_flush) {
     cleanup_db();
@@ -916,11 +922,10 @@ MACRO_TEST(db_wal_recovery_rejects_corrupted_batches) {
 static bool db_fault_delete_called = false;
 
 static int db_fault_fsync_file(void *f) {
-    (void)f; // FIX: Suppress unused parameter warning
+    (void)f;
     return -1; // Permanently simulate a broken disk
 }
 
-// FIX: Changed return type from 'int' to 'bool'
 static bool db_fault_delete_file(const char *path) {
     db_fault_delete_called = true;
     return local_posix_backend.delete_file(path);
@@ -931,6 +936,7 @@ MACRO_TEST(db_flush_job_backs_off_and_avoids_deadlock) {
 
     lsm_storage_backend_t fault_vfs;
     memcpy(&fault_vfs, &local_posix_backend, sizeof(lsm_storage_backend_t));
+
     fault_vfs.fsync_file = db_fault_fsync_file;
     fault_vfs.delete_file = db_fault_delete_file;
     db_fault_delete_called = false;

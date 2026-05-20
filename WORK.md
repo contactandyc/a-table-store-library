@@ -49,3 +49,48 @@ This final phase transformed the library from "theoretically correct" to "provab
 * **Read-Storm Cache Initialization:** Fired extreme multi-threaded read storms (`db_concurrent_reads_init_cache_safely`) at uninitialized SSTable blocks. Proved that the deduplicating `lsm_cache_put_or_get` mechanism safely coalesces racing reads into a single disk hit without leaking memory or double-freeing blocks.
 * **Group Commit & Lifecycle Validation:** Proved through 20-thread concurrent write storms (`db_group_commit_handles_concurrent_write_storms`) and rigorous background pool rejection tests that the database maintains strict sequence assignments and flawless memory lifetimes. *(To verify the TSAN requirement, you simply run your build script with `-fsanitize=thread`!)*
 
+### Phase 6: Strict Commit Ordering & WAL Concurrency
+
+This phase focused on closing subtle distributed-systems race conditions within the Group Commit pipeline, and mathematically securing the Write-Ahead Log so it can safely act as a unified, concurrent storage layer for multiple independent databases.
+
+* **Strict Commit Ticket System:** Resolved a critical TOCTOU (Time-of-Check to Time-of-Use) race in the Group Commit pipeline. Previously, a leader would build a batch, drop the admission `queue_mutex`, and then try to acquire the `write_mutex`. Under heavy CPU contention, a *second* leader could bypass the first, acquiring the write lock first, reserving sequence numbers out of order, and breaking MVCC. We introduced a strict chronological ticket dispenser (`commit_ticket_head` / `commit_ticket_tail`) ensuring batches acquire the write lock and execute in the exact order they entered the queue.
+* **Global Log Sequence Numbers (LSN):** Discovered and fixed a massive data-loss vulnerability in multi-table WAL garbage collection. Previously, tables checkpointed the WAL using their *internal* sequence numbers. If Table A flushed sequence 100, it could accidentally instruct the WAL to purge physical data that Table B (currently at sequence 50) still needed! We introduced a unified, monotonically increasing 64-bit Global LSN (`wal->next_lsn`). Every physical payload appended to the WAL now gets a unique LSN, completely isolating internal table sequences from physical disk geometry.
+* **Thread-Safe Shared WAL:** Because the `pool_wal_t` is shared across the entire `lsm_env_t`, multiple databases writing simultaneously could corrupt the active file descriptor or `file_offset` variables. We wrapped all physical file mutations (`pool_wal_append`, `pool_wal_rotate`, `pool_wal_sync`, `pool_wal_purge`) in a dedicated `wal->mu` mutex to guarantee thread-safe multiplexing.
+* **Asynchronous LSN Checkpointing:** Upgraded the `lsm_db_t` state machine to track `current_wal_lsn` alongside normal sequence numbers. When a memtable becomes immutable, it now captures its exact `imm_wal_lsn`. When the background thread successfully finishes building the SSTable, it checkpoints using this exact LSN, ensuring the WAL only drops data that is 100% durable on disk.
+* **Safe Table Unregistration:** Implemented `unregister_table` in the Pluggable WAL API. When a database closes, it now securely removes its checkpoint tracking entry from the shared WAL. This prevents a closed database from permanently stalling global WAL garbage collection for the rest of the environment.
+
+### Phase 7: Exact I/O Validation & Error Propagation
+
+*Focus: Ensuring partial writes are properly caught and bubbled up to the user.*
+
+* **VFS Signature Correction:** Change `lsm_storage_backend_t.append` to return `ssize_t`.
+* **Exact Byte Checks:** Audit all `append`, `pwrite`, and `pread` calls to assert that the returned byte count *exactly* matches the requested size. Treat short reads/writes as critical I/O errors.
+* **Strict WAL Errors:** Force `pwrite` failures and partial writes inside `pool_wal_append` to bubble up through the LSM translation layer (`lsm_api_append`). The `lsm_db_write` loop will correctly intercept this, abort, and return `false` to the user instead of blindly succeeding.
+
+### Phase 8: Contiguous Durability & Initialization Failsafes
+
+*Focus: Fixing the data-loss bugs during database shutdown and preventing state drift.*
+
+* **Contiguous Durability:** Revert the "drop stranded `imm_memtable` on close" logic added in Phase 4. If an older `imm_memtable` fails to flush to disk, the database must **never** checkpoint a newer sequence. Doing so tricks the WAL into purging records for the stranded data, causing permanent data loss. The database must retain the failed `imm_memtable` and refuse to bump the WAL checkpoint until the oldest stranded data is successfully written to disk.
+* **Builder & Manifest Null-Checks:** Check `sstable_builder_init` for `NULL` in background jobs and cleanly abort. Immediately reject in-memory `lsmc_version_edit` updates if `manifest_writer == NULL` to preserve strict disk durability.
+* **Thread Pool Zero-State:** Handle `num_threads == 0` gracefully by refusing async submission (running jobs synchronously on the caller's thread) or forcing at least 1 worker.
+
+### Phase 9: Parser Hardening & Math Overflows
+
+*Focus: Eliminating the remaining P1 fuzzing vulnerabilities in SSTable and Manifest IO.*
+
+* **Secure Decompression Casts:** Fix the bug in the SSTable iterator where `LZ4_decompress_safe` (which returns a signed `int`) is assigned directly to an unsigned `size_t` before checking for `< 0`.
+* **Strict Block Sizing:** Enforce `uncomp_size == idx->size - 9` for uncompressed blocks to prevent buffer overlaps.
+* **Manifest Uninitialized Memory Fencing:** Use `aml_zalloc` when allocating `a_files` arrays during manifest replay so that the cleanup loop doesn't attempt to `free()` garbage pointers if parsing fails halfway through.
+* **Math & Bounds Checking:** Validate all `pread` bounds, `filter_len`, and `idx_len` constraints during `sstable_reader_init`. Use overflow-safe `uint64_t` math for `blob_size`, `payload_len`, and `record_len` calculations.
+
+### Phase 10: Advanced Fault Verification (Testing)
+
+*Focus: Proving the fixes work under extreme adversarial conditions.*
+
+* **Write Tests For:**
+* Group Commit ordering (verifying sequential consistency under heavy contention).
+* Multi-table WAL GC (proving Table A's checkpoint doesn't delete Table B's un-flushed data).
+* Partial `append` failures (verifying the engine halts and rolls back).
+* Failed immutable flush plus newer writes (verifying contiguous durability).
+
