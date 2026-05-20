@@ -35,7 +35,7 @@ struct sstable_builder_s {
     char base_path[512];
 
     uint64_t current_file_offset;
-    bool has_error; // [Phase 4] Strict I/O tracking
+    bool has_error;
 
     uint8_t *block_buf;
     size_t block_pos;
@@ -109,7 +109,6 @@ sstable_builder_t *sstable_builder_init(const char *base_path, lsm_storage_backe
     return b;
 }
 
-// [Phase 4] Safe Orphan File Cleanup
 void sstable_builder_abort(sstable_builder_t *b) {
     if (!b) return;
     if (b->data_writer) {
@@ -121,7 +120,7 @@ void sstable_builder_abort(sstable_builder_t *b) {
     b->backend->delete_file(path);
 
     snprintf(path, sizeof(path), "%s.meta", b->base_path);
-    b->backend->delete_file(path); // Backend safely ignores this if it doesn't exist yet
+    b->backend->delete_file(path);
 
     if (b->bloom) bloom_destroy(b->bloom);
     if (b->bitmap) aml_free(b->bitmap);
@@ -158,9 +157,9 @@ static bool flush_data_block(sstable_builder_t *b) {
     trailer[4] = compression_flag;
     encode_u32_le(trailer + 5, checksum);
 
-    // [Phase 4] Strict I/O Return Checking
-    if (b->backend->append(b->data_writer, final_buf, final_size) < 0) { b->has_error = true; return false; }
-    if (b->backend->append(b->data_writer, trailer, 9) < 0) { b->has_error = true; return false; }
+    // [Phase 7] Strict Exact-Byte I/O Return Checking
+    if (b->backend->append(b->data_writer, final_buf, final_size) != (ssize_t)final_size) { b->has_error = true; return false; }
+    if (b->backend->append(b->data_writer, trailer, 9) != 9) { b->has_error = true; return false; }
 
     size_t required_idx = 4 + b->last_key_len + 8 + 8;
     if (b->index_pos + required_idx > b->index_cap) {
@@ -286,10 +285,11 @@ uint64_t sstable_builder_finish(sstable_builder_t *b) {
     void *meta_writer = b->backend->open_writer(meta_path);
     if (!meta_writer) { sstable_builder_abort(b); return 0; }
 
+    // [Phase 7] Exact-Byte I/O Returns
     bool m_ok = true;
-    if (b->backend->append(meta_writer, "META", 4) < 0) m_ok = false;
+    if (b->backend->append(meta_writer, "META", 4) != 4) m_ok = false;
     uint8_t f_type = (uint8_t)b->filter_type;
-    if (b->backend->append(meta_writer, &f_type, 1) < 0) m_ok = false;
+    if (b->backend->append(meta_writer, &f_type, 1) != 1) m_ok = false;
 
     uint32_t filter_len = 0;
     void *filter_data = NULL;
@@ -310,16 +310,16 @@ uint64_t sstable_builder_finish(sstable_builder_t *b) {
 
     uint8_t sz_buf[4];
     encode_u32_le(sz_buf, filter_len);
-    if (b->backend->append(meta_writer, sz_buf, 4) < 0) m_ok = false;
+    if (b->backend->append(meta_writer, sz_buf, 4) != 4) m_ok = false;
 
     if (filter_len > 0) {
-        if (b->backend->append(meta_writer, filter_data, filter_len) < 0) m_ok = false;
+        if (b->backend->append(meta_writer, filter_data, filter_len) != (ssize_t)filter_len) m_ok = false;
         aml_free(filter_data);
     }
 
     encode_u32_le(sz_buf, b->index_pos);
-    if (b->backend->append(meta_writer, sz_buf, 4) < 0) m_ok = false;
-    if (b->backend->append(meta_writer, b->index_buf, b->index_pos) < 0) m_ok = false;
+    if (b->backend->append(meta_writer, sz_buf, 4) != 4) m_ok = false;
+    if (b->backend->append(meta_writer, b->index_buf, b->index_pos) != (ssize_t)b->index_pos) m_ok = false;
 
     if (b->backend->fsync_file(meta_writer) < 0) m_ok = false;
     b->backend->close_writer(meta_writer);

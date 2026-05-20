@@ -453,6 +453,45 @@ MACRO_TEST(sstable_builder_cleans_up_on_io_error) {
     MACRO_ASSERT_TRUE(f == NULL); // Should not exist
 }
 
+// --- FAULTY VFS FOR PARTIAL WRITES ---
+static ssize_t fault_partial_append(void *ctx, const void *buf, size_t size) {
+    if (size > 15) {
+        // Simulate a disk running out of space and only writing part of the payload!
+        ssize_t written = local_posix_backend.append(ctx, buf, size - 5);
+        return written; // Returns less than requested
+    }
+    return local_posix_backend.append(ctx, buf, size);
+}
+
+MACRO_TEST(sstable_builder_rejects_partial_writes) {
+    cleanup_files();
+
+    lsm_storage_backend_t partial_vfs;
+    memcpy(&partial_vfs, &local_posix_backend, sizeof(lsm_storage_backend_t));
+    partial_vfs.append = fault_partial_append;
+
+    const char *base = "/tmp/sstable_partial_test";
+    sstable_builder_t *b = sstable_builder_init(base, &partial_vfs, FILTER_NONE, 10);
+    MACRO_ASSERT_TRUE(b != NULL);
+
+    char ikey[1024];
+    pack_binary_ikey(ikey, "key1", 4, 1, OP_PUT);
+
+    char large_val[100];
+    memset(large_val, 'A', 100);
+
+    // This will trigger the partial_append logic and return 'size - 5'
+    sstable_builder_add(b, ikey, 4 + 8, large_val, 100);
+
+    // The builder MUST detect the exact-byte mismatch, abort, and return 0
+    uint64_t size = sstable_builder_finish(b);
+    MACRO_ASSERT_EQ_INT(size, 0);
+
+    // Ensure the corrupted, partially written file was safely deleted
+    FILE *f = fopen("/tmp/sstable_partial_test.data", "r");
+    MACRO_ASSERT_TRUE(f == NULL);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -467,6 +506,7 @@ int main(void) {
     MACRO_ADD(tests, sstable_reader_rejects_restart_array_underflow);
     MACRO_ADD(tests, sstable_bitmap_filter_allows_out_of_range_reads);
     MACRO_ADD(tests, sstable_builder_cleans_up_on_io_error);
+    MACRO_ADD(tests, sstable_builder_rejects_partial_writes);
 
     macro_run_all("lsm_sstable_disk_format", tests, test_count);
     return 0;

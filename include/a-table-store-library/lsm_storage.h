@@ -21,7 +21,9 @@ struct lsm_storage_backend_s {
 
     // [Phase 4A Fix] Return ssize_t to properly indicate IO errors (-1) vs EOF (0)
     ssize_t (*pread)(void *ctx, void *buf, size_t size, uint64_t offset);
-    size_t (*append)(void *ctx, const void *buf, size_t size);
+
+    // [Phase 7 Fix] Return ssize_t to allow negative error codes
+    ssize_t (*append)(void *ctx, const void *buf, size_t size);
 
     // Explicit sync to disk
     int (*fsync_file)(void *ctx);

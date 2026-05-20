@@ -99,7 +99,12 @@ int pool_wal_init(pool_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
 
         preallocate_file(wal->active_fd, wal->segment_size_bytes);
         pool_file_header_t hdr = { WAL_MAGIC_NUMBER, 1, wal->next_lsn, 0 };
-        pwrite(wal->active_fd, &hdr, sizeof(hdr), 0);
+
+        // [Phase 7] Catch partial initialization write
+        if (pwrite(wal->active_fd, &hdr, sizeof(hdr), 0) != sizeof(hdr)) {
+            close(wal->active_fd);
+            return -1;
+        }
 
     } else {
         wal->oldest_seg_id = min_seg;
@@ -109,7 +114,6 @@ int pool_wal_init(pool_wal_t* wal, const char* dir, uint64_t segment_size_mb, ui
         get_segment_path(wal, max_seg, path);
         wal->active_fd = open(path, O_RDWR, 0644);
 
-        // [Phase 6] Fast-forward to the exact end of the log and recover the LSN.
         wal->next_lsn = 1;
         pool_file_header_t fhdr;
         if (pread(wal->active_fd, &fhdr, sizeof(fhdr), 0) == sizeof(fhdr)) {

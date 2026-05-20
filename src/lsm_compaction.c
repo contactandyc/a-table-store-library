@@ -405,13 +405,13 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
         uint32_t crc = XXH32(buf, record_len, 0);
         uint8_t wrap[4];
 
-        // [Phase 4] Transactional Error Checking for Manifest IO
+        // [Phase 7] Transactional Exact-Byte Checking for Manifest IO
         bool ok = true;
         encode_u32_le(wrap, record_len);
-        if (manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4) < 0) ok = false;
-        if (ok && manifest->env->router.hot_vfs->append(manifest->manifest_writer, buf, record_len) < 0) ok = false;
+        if (manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4) != 4) ok = false;
+        if (ok && manifest->env->router.hot_vfs->append(manifest->manifest_writer, buf, record_len) != (ssize_t)record_len) ok = false;
         encode_u32_le(wrap, crc);
-        if (ok && manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4) < 0) ok = false;
+        if (ok && manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4) != 4) ok = false;
         if (ok && manifest->env->router.hot_vfs->fsync_file(manifest->manifest_writer) < 0) ok = false;
 
         aml_free(buf);

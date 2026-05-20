@@ -14,7 +14,7 @@ typedef struct { int fd; } posix_file_t;
 static void* posix_open_reader(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
-    posix_file_t *f = aml_malloc(sizeof(posix_file_t)); // [Phase 4A Fix] Standardize allocators
+    posix_file_t *f = aml_malloc(sizeof(posix_file_t));
     if (!f) { close(fd); return NULL; }
     f->fd = fd;
     return f;
@@ -47,15 +47,16 @@ static ssize_t posix_pread(void *ctx, void *buf, size_t size, uint64_t offset) {
         ssize_t ret = pread(fd, ptr + total_read, size - total_read, offset + total_read);
         if (ret < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
-            return -1; // [Phase 4A Fix] Return explicit IO error
+            return -1;
         }
         if (ret == 0) break; // EOF
         total_read += ret;
     }
-    return total_read;
+    return (ssize_t)total_read;
 }
 
-static size_t posix_append(void *ctx, const void *buf, size_t size) {
+// [Phase 7 Fix] Strict return types and explicit error propagation
+static ssize_t posix_append(void *ctx, const void *buf, size_t size) {
     int fd = ((posix_file_t*)ctx)->fd;
     size_t total_written = 0;
     const char *ptr = (const char *)buf;
@@ -64,11 +65,12 @@ static size_t posix_append(void *ctx, const void *buf, size_t size) {
         ssize_t ret = write(fd, ptr + total_written, size - total_written);
         if (ret < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
-            break;
+            return -1; // Explicit error
         }
+        if (ret == 0) return -1; // Safety breakout to avoid infinite loops on broken pipes
         total_written += ret;
     }
-    return total_written;
+    return (ssize_t)total_written;
 }
 
 static int posix_fsync(void *ctx) {

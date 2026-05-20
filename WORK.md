@@ -61,11 +61,12 @@ This phase focused on closing subtle distributed-systems race conditions within 
 
 ### Phase 7: Exact I/O Validation & Error Propagation
 
-*Focus: Ensuring partial writes are properly caught and bubbled up to the user.*
+This phase focused on closing a critical vulnerability where physical disk write errors (such as disk exhaustion or disconnected network drives) were being silently ignored by the database, leading to silent data corruption.
 
-* **VFS Signature Correction:** Change `lsm_storage_backend_t.append` to return `ssize_t`.
-* **Exact Byte Checks:** Audit all `append`, `pwrite`, and `pread` calls to assert that the returned byte count *exactly* matches the requested size. Treat short reads/writes as critical I/O errors.
-* **Strict WAL Errors:** Force `pwrite` failures and partial writes inside `pool_wal_append` to bubble up through the LSM translation layer (`lsm_api_append`). The `lsm_db_write` loop will correctly intercept this, abort, and return `false` to the user instead of blindly succeeding.
+* **VFS Signature Correction:** Discovered and fixed a flaw where the virtual file system's `append` function returned an unsigned `size_t`. Downstream caller checks of `if (append(...) < 0)` compiled successfully but were mathematically impossible, masking all OS-level write failures. Changed the `lsm_storage_backend_t.append` signature to return a signed `ssize_t` to properly propagate `-1` error states.
+* **Exact-Byte Verification:** Hardened the SSTable Builder and Manifest Writer to treat partial writes as critical errors. Rather than just checking for `< 0`, every `append` operation now strictly asserts that the returned byte count *exactly matches* the requested payload size (`append(...) != (ssize_t)size`). This ensures the database instantly halts if the disk runs out of space midway through writing a block.
+* **Transactional Manifest Edits:** Wrapped the critical `CURRENT.manifest` appending logic in exact-byte checks. If a version edit write fails partially, the engine now gracefully returns `false` without contaminating the in-memory `lsm_manifest_t` state, allowing the system to retry safely later.
+* **Simulated Partial Write Testing:** Added a specialized adversarial test (`sstable_builder_rejects_partial_writes`) utilizing a mock VFS that intentionally truncates payload writes by 5 bytes to simulate abrupt disk exhaustion. Proved that the builder correctly intercepts the exact-byte mismatch, aborts the write, returns a failure code, and successfully wipes the corrupted file fragment from disk.
 
 ### Phase 8: Contiguous Durability & Initialization Failsafes
 
