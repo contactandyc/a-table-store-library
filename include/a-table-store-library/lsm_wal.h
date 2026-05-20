@@ -29,8 +29,8 @@ struct lsm_wal_iter_s {
 struct lsm_wal_s {
     void *ctx;
 
-    /* Append a multiplexed record to the log */
-    bool (*append)(lsm_wal_t *wal, uint32_t table_id, uint8_t op,
+    /* Append a multiplexed record to the log. Added seq_num for tight integration. */
+    bool (*append)(lsm_wal_t *wal, uint32_t table_id, uint64_t seq_num, uint8_t op,
                    const void *key, uint32_t klen,
                    const void *val, uint32_t vlen);
 

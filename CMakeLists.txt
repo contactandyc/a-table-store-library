@@ -64,6 +64,7 @@ add_library(a_table_store_library_debug STATIC
   src/lsm_pool.c
   src/lsm_storage.c
   src/memtable.c
+  src/pool_wal.c
   src/sstable_builder.c
   src/sstable_reader.c
 )
@@ -105,6 +106,7 @@ add_library(a_table_store_library_memory STATIC
   src/lsm_pool.c
   src/lsm_storage.c
   src/memtable.c
+  src/pool_wal.c
   src/sstable_builder.c
   src/sstable_reader.c
 )
@@ -149,6 +151,7 @@ add_library(a_table_store_library_static STATIC
   src/lsm_pool.c
   src/lsm_storage.c
   src/memtable.c
+  src/pool_wal.c
   src/sstable_builder.c
   src/sstable_reader.c
 )
@@ -190,6 +193,7 @@ add_library(a_table_store_library_shared SHARED
   src/lsm_pool.c
   src/lsm_storage.c
   src/memtable.c
+  src/pool_wal.c
   src/sstable_builder.c
   src/sstable_reader.c
 )

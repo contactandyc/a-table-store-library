@@ -62,6 +62,7 @@ add_executable(test_lsm_cache
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_pool.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_storage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/memtable.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/pool_wal.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_builder.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_reader.c
 )
@@ -120,6 +121,7 @@ add_executable(test_lsm_db
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_pool.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_storage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/memtable.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/pool_wal.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_builder.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_reader.c
 )
@@ -178,6 +180,7 @@ add_executable(test_memtable
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_pool.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_storage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/memtable.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/pool_wal.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_builder.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_reader.c
 )
@@ -224,6 +227,65 @@ endif()
 
 add_test(NAME test_memtable COMMAND $<TARGET_FILE:test_memtable>)
 # ==============================================================================
+# test_pool_wal Target (Standard Test)
+# ==============================================================================
+add_executable(test_pool_wal
+  src/test_pool_wal.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_arena.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_cache.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_compaction.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_db.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_env.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_pool.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_storage.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/memtable.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/pool_wal.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_builder.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_reader.c
+)
+
+target_include_directories(test_pool_wal BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+
+list(APPEND TEST_EXECUTABLES test_pool_wal)
+
+set_target_properties(test_pool_wal PROPERTIES
+  C_STANDARD 23
+  C_STANDARD_REQUIRED YES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED YES
+)
+
+target_link_libraries(test_pool_wal PRIVATE a_memory_library::a_memory_library)
+target_link_libraries(test_pool_wal PRIVATE a_bloom_filter_library::a_bloom_filter_library)
+target_link_libraries(test_pool_wal PRIVATE the_macro_library::the_macro_library)
+target_link_libraries(test_pool_wal PRIVATE the_lz4_library::the_lz4_library)
+target_link_libraries(test_pool_wal PRIVATE a_table_store_library::a_table_store_library)
+
+if(M_LIB)
+  target_link_libraries(test_pool_wal PRIVATE ${M_LIB})
+endif()
+
+if(MSVC)
+  target_compile_options(test_pool_wal PRIVATE /W4 ${TEST_COMPILER_OPTS})
+else()
+  target_compile_options(test_pool_wal PRIVATE -Wall -Wextra -Wpedantic ${TEST_COMPILER_OPTS})
+endif()
+
+if(A_ENABLE_COVERAGE)
+  if (CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(test_pool_wal PRIVATE -O0 -g -fprofile-instr-generate -fcoverage-mapping)
+    target_link_options(test_pool_wal PRIVATE -fprofile-instr-generate -fcoverage-mapping)
+  elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(test_pool_wal PRIVATE -O0 -g --coverage)
+    target_link_options(test_pool_wal PRIVATE --coverage)
+  endif()
+endif()
+
+add_test(NAME test_pool_wal COMMAND $<TARGET_FILE:test_pool_wal>)
+# ==============================================================================
 # test_sstable Target (Standard Test)
 # ==============================================================================
 add_executable(test_sstable
@@ -236,6 +298,7 @@ add_executable(test_sstable
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_pool.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/lsm_storage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/memtable.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/pool_wal.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_builder.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/sstable_reader.c
 )

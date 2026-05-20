@@ -31,10 +31,11 @@ static void mock_wal_checkpoint(lsm_wal_t *wal, uint32_t table_id, uint64_t seq_
     last_checkpoint_seq = seq_num;
     wal_checkpoint_called = true;
 }
-static bool mock_wal_append(lsm_wal_t *w, uint32_t t, uint8_t o, const void *k, uint32_t kl, const void *v, uint32_t vl) {
-    (void)w; (void)t; (void)o; (void)k; (void)kl; (void)v; (void)vl;
+static bool mock_wal_append(lsm_wal_t *w, uint32_t t, uint64_t s, uint8_t o, const void *k, uint32_t kl, const void *v, uint32_t vl) {
+    (void)w; (void)t; (void)s; (void)o; (void)k; (void)kl; (void)v; (void)vl;
     return true;
 }
+
 static void mock_wal_sync(lsm_wal_t *w) { (void)w; }
 static void mock_wal_close(lsm_wal_t *w) { (void)w; }
 static lsm_wal_iter_t* mock_wal_iter_init(lsm_wal_t *w) { (void)w; return NULL; }

@@ -689,7 +689,7 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
             curr = curr->next;
         }
 
-        db->env->global_wal->append(db->env->global_wal, db->table_id, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
+        db->env->global_wal->append(db->env->global_wal, db->table_id, start_seq, 2 /* OP_BATCH */, NULL, 0, blob, blob_size);
         aml_free(blob);
     }
 
