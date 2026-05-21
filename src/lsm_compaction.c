@@ -114,6 +114,12 @@ static heap_node_t lsmc_heap_pop(min_heap_t *h) {
     return root;
 }
 
+// Forward declare internal locked edit function
+static bool lsmc_version_edit_core(lsm_manifest_t *manifest, int source_level, int target_level,
+                                   sstable_meta_t **deleted_files, size_t num_deleted,
+                                   sstable_meta_t **added_files, size_t num_added, bool is_replay);
+
+
 static void replay_manifest(lsm_manifest_t *m, const char *path) {
     void *reader = m->env->router.hot_vfs->open_reader(path);
     if (!reader) return;
@@ -126,7 +132,6 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         uint32_t record_len = decode_u32_le(len_buf);
         offset += 4;
 
-        // [Phase 3] Manifest size bounds checking (prevent memory attacks)
         if (record_len < 16 || record_len > 16 * 1024 * 1024) break;
 
         uint8_t *buf = aml_malloc(record_len);
@@ -151,7 +156,6 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         uint32_t num_add = decode_u32_le(buf + 12);
         uint64_t ptr = 16;
 
-        // [Phase 3] Guard against impossible file counts
         if (num_del > 100000 || num_add > 100000) { aml_free(buf); break; }
         if (ptr + (num_del * 8) > record_len) { aml_free(buf); break; }
 
@@ -182,9 +186,8 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         bool parse_failed = false;
 
         if (num_add > 0) {
-            a_files = aml_malloc(num_add * sizeof(sstable_meta_t*));
+            a_files = aml_zalloc(num_add * sizeof(sstable_meta_t*));
             for (uint32_t a = 0; a < num_add; a++) {
-                // Minimum bytes required for a single file addition metadata structure (8+8+4+8 + 4 + 4 = 36)
                 if (ptr + 36 > record_len) { parse_failed = true; break; }
 
                 sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
@@ -219,7 +222,6 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
         }
 
         if (parse_failed) {
-            // Memory bounds hit: safely cleanup and abort parsing
             if (d_files) aml_free(d_files);
             if (a_files) {
                 for(uint32_t a=0; a<num_add; a++) {
@@ -236,7 +238,9 @@ static void replay_manifest(lsm_manifest_t *m, const char *path) {
             break;
         }
 
-        lsmc_version_edit(m, src_lvl, tgt_lvl, d_files, num_del, a_files, num_add);
+        // Send 'true' to indicate we are replaying so it doesn't fail the disk check
+        lsmc_version_edit_core(m, src_lvl, tgt_lvl, d_files, num_del, a_files, num_add, true);
+
         if (d_files) aml_free(d_files);
         if (a_files) aml_free(a_files);
         aml_free(buf);
@@ -316,7 +320,6 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
                 meta->ref_count--;
 
                 if (meta->ref_count == 0) {
-                    // [Phase 5B Fix] Destroy the cached reader upon metadata death
                     if (meta->cached_reader) {
                         sstable_reader_destroy(meta->cached_reader);
                     }
@@ -367,10 +370,16 @@ void lsmc_version_release(lsm_manifest_t *manifest, lsm_version_t *v) {
     }
 }
 
-bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_level,
-                       sstable_meta_t **deleted_files, size_t num_deleted,
-                       sstable_meta_t **added_files, size_t num_added) {
+// Fixed Deadlock Free Version Edit Core
+static bool lsmc_version_edit_core(lsm_manifest_t *manifest, int source_level, int target_level,
+                                   sstable_meta_t **deleted_files, size_t num_deleted,
+                                   sstable_meta_t **added_files, size_t num_added, bool is_replay) {
     pthread_mutex_lock(&manifest->version_mutex);
+
+    if (!is_replay && !manifest->manifest_writer) {
+        pthread_mutex_unlock(&manifest->version_mutex);
+        return false;
+    }
 
     if (manifest->manifest_writer) {
         uint32_t record_len = 16 + (num_deleted * 8);
@@ -405,7 +414,6 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
         uint32_t crc = XXH32(buf, record_len, 0);
         uint8_t wrap[4];
 
-        // [Phase 7] Transactional Exact-Byte Checking for Manifest IO
         bool ok = true;
         encode_u32_le(wrap, record_len);
         if (manifest->env->router.hot_vfs->append(manifest->manifest_writer, wrap, 4) != 4) ok = false;
@@ -417,7 +425,6 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
         aml_free(buf);
 
         if (!ok) {
-            // Memory state remains untainted, safely return false
             pthread_mutex_unlock(&manifest->version_mutex);
             return false;
         }
@@ -494,10 +501,18 @@ bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_le
 
     lsm_version_t *old_version = manifest->current_version;
     manifest->current_version = v;
-    pthread_mutex_unlock(&manifest->version_mutex);
 
+    // Unlock strictly BEFORE releasing the old version
+    pthread_mutex_unlock(&manifest->version_mutex);
     lsmc_version_release(manifest, old_version);
     return true;
+}
+
+// Public API
+bool lsmc_version_edit(lsm_manifest_t *manifest, int source_level, int target_level,
+                       sstable_meta_t **deleted_files, size_t num_deleted,
+                       sstable_meta_t **added_files, size_t num_added) {
+    return lsmc_version_edit_core(manifest, source_level, target_level, deleted_files, num_deleted, added_files, num_added, false);
 }
 
 bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t oldest_snapshot) {
@@ -563,7 +578,6 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
         } while (expanded);
     }
 
-    // [Phase 4] Accurate Pointers: Identify the true max_key AFTER the expansion loop completes
     sstable_meta_t *max_cand = source_inputs[0];
     for (size_t i = 1; i < num_source_inputs; i++) {
         uint32_t ulen1 = get_user_key_len(max_cand->max_key_len);
@@ -661,7 +675,7 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
     bool is_bottom_level = (source_level + 1 == MAX_LEVELS - 1);
 
     uint64_t last_kept_seq = UINT64_MAX;
-    bool compaction_failed = false; // [Phase 4] Fail-safe tracking
+    bool compaction_failed = false;
 
     while (heap.size > 0) {
         heap_node_t top = lsmc_heap_pop(&heap);
@@ -693,10 +707,14 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
                 lsmc_generate_base_path(filepath, manifest->db_directory, current_out_id);
                 builder = sstable_builder_init(filepath, target_vfs, FILTER_BLOOM, 20000);
 
+                if (!builder) {
+                    compaction_failed = true;
+                    break;
+                }
+
                 if (num_allocated_new_files >= new_files_cap) {
                     new_files_cap *= 2;
                     new_files = aml_realloc(new_files, new_files_cap * sizeof(sstable_meta_t*));
-                    // Zero the newly allocated portion
                     memset(new_files + num_allocated_new_files, 0, (new_files_cap - num_allocated_new_files) * sizeof(sstable_meta_t*));
                 }
 
@@ -769,13 +787,11 @@ bool lsmc_compact_level(lsm_manifest_t *manifest, int source_level, uint64_t old
         sstable_iter_destroy(iters[i]);
     }
 
-    // [Phase 4] Safe Orphan Cleanup on I/O Errors
     if (compaction_failed || !lsmc_version_edit(manifest, source_level, source_level + 1, merge_inputs, num_inputs, new_files, num_new_files)) {
         if (builder) sstable_builder_abort(builder);
 
         for (size_t i = 0; i < num_allocated_new_files; i++) {
             if (i < num_new_files) {
-                // If it succeeded previously but the later batches or manifest failed, shred the disk evidence
                 char base[512], datapath[520], metapath[520];
                 lsmc_generate_base_path(base, manifest->db_directory, new_files[i]->file_id);
                 snprintf(datapath, 520, "%s.data", base);

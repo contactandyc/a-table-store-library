@@ -69,11 +69,9 @@ struct lsm_db_s {
     uint64_t current_seq;
     uint64_t imm_seq;
 
-    // [Phase 6] Global LSN Tracking for Safe GC
     uint64_t current_wal_lsn;
     uint64_t imm_wal_lsn;
 
-    // Snapshot tracking
     uint64_t *snapshots;
     size_t num_snapshots;
     size_t snapshots_cap;
@@ -83,7 +81,6 @@ struct lsm_db_s {
     pthread_mutex_t queue_mutex;
     pthread_cond_t stall_cond;
 
-    // [Phase 6] Strict Commit Ordering Tickets
     uint64_t commit_ticket_head;
     uint64_t commit_ticket_tail;
     pthread_cond_t commit_cv;
@@ -173,7 +170,7 @@ static void perform_flush_job(void *arg) {
     pthread_mutex_lock(&db->state_mutex);
     memtable_t *imm = db->imm_memtable;
     if (imm) memtable_retain(imm);
-    uint64_t flushed_lsn = db->imm_wal_lsn; // [Phase 6] Target the LSN
+    uint64_t flushed_lsn = db->imm_wal_lsn;
     pthread_mutex_unlock(&db->state_mutex);
 
     if (!imm) {
@@ -193,6 +190,20 @@ static void perform_flush_job(void *arg) {
     snprintf(base_path, sizeof(base_path), "%s/%06llu", db->db_dir, (unsigned long long)file_id);
 
     sstable_builder_t *builder = sstable_builder_init(base_path, db->env->router.hot_vfs, FILTER_BLOOM, est_elements);
+
+    // [Phase 8] Safe Initialization Failsafe
+    if (!builder) {
+        pthread_mutex_lock(&db->state_mutex);
+        db->is_flushing = false;
+        pthread_cond_broadcast(&db->stall_cond);
+        pthread_mutex_unlock(&db->state_mutex);
+
+        if (imm) memtable_release(imm);
+        db_release_job(db);
+        lsm_db_release(db);
+        return;
+    }
+
     sstable_meta_t *meta = aml_zalloc(sizeof(sstable_meta_t));
     meta->file_id = file_id;
     pthread_mutex_init(&meta->reader_mutex, NULL);
@@ -283,7 +294,6 @@ static void perform_flush_job(void *arg) {
         return;
     }
 
-    // [Phase 6] DELAYED CHECKPOINT: Use global flushed LSN
     if (db->env->global_wal && db->env->global_wal->checkpoint && flushed_lsn > 0) {
         db->env->global_wal->checkpoint(db->env->global_wal, db->table_id, flushed_lsn);
     }
@@ -312,21 +322,22 @@ static void perform_flush_job(void *arg) {
     lsmc_version_release(db->manifest, v);
 
     if (target_lvl != -1) {
+        bool need_compaction = false;
         pthread_mutex_lock(&db->state_mutex);
         if (!db->is_compacting) {
             db->is_compacting = true;
             db->active_jobs++;
             db->owner_refs++;
-            if (!lsm_pool_submit(db->env->bg_pool, perform_compaction_job, db, JOB_PRIORITY_HIGH)) {
-                db->is_compacting = false;
-                db->active_jobs--;
-                db->owner_refs--;
-                if (db->closing && db->active_ops == 0 && db->active_jobs == 0) {
-                    pthread_cond_broadcast(&db->stall_cond);
-                }
-            }
+            need_compaction = true;
         }
         pthread_mutex_unlock(&db->state_mutex);
+
+        // Submit completely lock-free
+        if (need_compaction) {
+            if (!lsm_pool_submit(db->env->bg_pool, perform_compaction_job, db, JOB_PRIORITY_HIGH)) {
+                perform_compaction_job(db); // Synchronous fallback
+            }
+        }
     }
 
     db_release_job(db);
@@ -382,7 +393,6 @@ lsm_db_t *lsm_db_open(lsm_env_t *env, uint32_t table_id, const char *db_director
     db->current_seq = max_seq > 0 ? max_seq : 1;
     db->imm_seq = 0;
 
-    // [Phase 6] Init Ticket Dispenser
     db->commit_ticket_head = 0;
     db->commit_ticket_tail = 0;
     pthread_cond_init(&db->commit_cv, NULL);
@@ -429,7 +439,7 @@ void lsm_db_release(lsm_db_t *db) {
         pthread_mutex_destroy(&db->write_mutex);
         pthread_mutex_destroy(&db->queue_mutex);
         pthread_cond_destroy(&db->stall_cond);
-        pthread_cond_destroy(&db->commit_cv); // [Phase 6]
+        pthread_cond_destroy(&db->commit_cv);
         aml_free(db);
     }
 }
@@ -447,7 +457,6 @@ void lsm_db_close(lsm_db_t *db) {
 
     lsm_env_unregister_db(db->env, db);
 
-    // [Phase 6] Unregister table so it stops blocking global WAL GC
     if (db->env->global_wal && db->env->global_wal->unregister_table) {
         db->env->global_wal->unregister_table(db->env->global_wal, db->table_id);
     }
@@ -464,16 +473,14 @@ void lsm_db_close(lsm_db_t *db) {
 
     pthread_mutex_lock(&db->write_mutex);
 
-    if (db->imm_memtable != NULL) {
-        atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->imm_memtable));
-        memtable_release(db->imm_memtable);
-        db->imm_memtable = NULL;
-    }
+    // [Phase 8] Contiguous Durability Fix
+    bool can_flush_final = (db->imm_memtable == NULL);
+    bool need_submit = false;
 
-    if (memtable_first(db->memtable)) {
+    if (can_flush_final && memtable_first(db->memtable)) {
         db->imm_memtable = db->memtable;
         db->imm_seq = db->current_seq;
-        db->imm_wal_lsn = db->current_wal_lsn; // [Phase 6] Transfer LSN identity
+        db->imm_wal_lsn = db->current_wal_lsn;
 
         db->memtable = memtable_init();
         atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
@@ -486,28 +493,24 @@ void lsm_db_close(lsm_db_t *db) {
         db->is_flushing = true;
         db->active_jobs++;
         db->owner_refs++;
-        if (!lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT)) {
-            db->active_jobs--;
-            db->owner_refs--;
-            pthread_mutex_unlock(&db->state_mutex);
-
-            pthread_mutex_lock(&db->state_mutex);
-            db->active_jobs++;
-            db->owner_refs++;
-            pthread_mutex_unlock(&db->state_mutex);
-            perform_flush_job(db);
-        } else {
-            pthread_mutex_unlock(&db->state_mutex);
-        }
+        need_submit = true;
+        pthread_mutex_unlock(&db->state_mutex);
     }
     pthread_mutex_unlock(&db->write_mutex);
 
-    pthread_mutex_lock(&db->state_mutex);
+    // Completely lock-free submission
+    if (need_submit) {
+        if (!lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT)) {
+            perform_flush_job(db); // Synchronous fallback
+        }
+    }
 
+    pthread_mutex_lock(&db->state_mutex);
     while (db->active_jobs > 0 || db->is_flushing || db->is_compacting) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
 
+    // [Phase 8] Safe memory reclamation without WAL checkpointing
     if (db->imm_memtable != NULL) {
         atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->imm_memtable));
         memtable_release(db->imm_memtable);
@@ -557,7 +560,7 @@ bool lsm_db_force_flush(lsm_db_t *db) {
 
     db->imm_memtable = db->memtable;
     db->imm_seq = db->current_seq;
-    db->imm_wal_lsn = db->current_wal_lsn; // [Phase 6]
+    db->imm_wal_lsn = db->current_wal_lsn;
 
     db->memtable = memtable_init();
     atomic_fetch_add(&db->env->global_mem_usage, memtable_get_memory_usage(db->memtable));
@@ -566,22 +569,23 @@ bool lsm_db_force_flush(lsm_db_t *db) {
         db->env->global_wal->sync(db->env->global_wal);
     }
 
+    bool need_submit = false;
     if (!db->is_flushing) {
         db->is_flushing = true;
         db->active_jobs++;
         db->owner_refs++;
-        if (!lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT)) {
-            db->is_flushing = false;
-            db->active_jobs--;
-            db->owner_refs--;
-            if (db->closing && db->active_ops == 0 && db->active_jobs == 0) {
-                pthread_cond_broadcast(&db->stall_cond);
-            }
-        }
+        need_submit = true;
     }
 
     pthread_mutex_unlock(&db->state_mutex);
     pthread_mutex_unlock(&db->write_mutex);
+
+    // Completely lock-free submission
+    if (need_submit) {
+        if (!lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT)) {
+            perform_flush_job(db); // Synchronous fallback
+        }
+    }
 
     db_release_op(db);
     return true;
@@ -623,7 +627,6 @@ static void stall_for_memory(lsm_env_t *env) {
     }
 }
 
-// [Phase 6] Track LSN on recovery
 void lsm_db_inject_recovery_seq(lsm_db_t *db, uint64_t seq, uint64_t lsn, uint8_t op, const void *key, uint32_t klen, const void *val, uint32_t vlen) {
     if (!db_try_acquire_op(db)) return;
     pthread_mutex_lock(&db->write_mutex);
@@ -714,7 +717,6 @@ void lsm_write_batch_destroy(lsm_write_batch_t *b) {
     aml_free(b);
 }
 
-// [Phase 6] Strictly Ticketed Group Commit Pipeline
 bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     if (!batch || batch->count == 0) return true;
 
@@ -728,7 +730,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     w.next = NULL;
     pthread_cond_init(&w.cv, NULL);
 
-    // 1. Admission Control
     pthread_mutex_lock(&db->queue_mutex);
 
     bool is_leader = (db->writer_queue_head == NULL);
@@ -757,8 +758,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
         return succ;
     }
 
-    // --- LEADER ---
-    // [Phase 6] Draw ticket immediately before detaching the queue
     my_ticket = db->commit_ticket_head++;
 
     lsm_writer_t *curr = db->writer_queue_head;
@@ -779,7 +778,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
         curr = curr->next;
     }
 
-    // 2. Detach Batch & Pass Baton
     db->writer_queue_head = last_writer->next;
     if (db->writer_queue_head == NULL) {
         db->writer_queue_tail = NULL;
@@ -790,10 +788,8 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     last_writer->next = NULL;
     pthread_mutex_unlock(&db->queue_mutex);
 
-    // [Phase 6] 3. Serialize Atomic I/O By Ticket Order
     pthread_mutex_lock(&db->write_mutex);
 
-    // Do not proceed until it is strictly this batch's turn
     while (db->commit_ticket_tail != my_ticket) {
         pthread_cond_wait(&db->commit_cv, &db->write_mutex);
     }
@@ -835,7 +831,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
             curr = curr->next;
         }
 
-        // [Phase 6] Capture the assigned LSN
         if (!db->env->global_wal->append(db->env->global_wal, db->table_id, wal_seq, 2 /* OP_BATCH */, NULL, 0, blob, blob_size, &assigned_lsn)) {
             write_success = false;
         }
@@ -845,7 +840,7 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     size_t diff = 0;
     if (write_success) {
         if (assigned_lsn > db->current_wal_lsn) {
-            db->current_wal_lsn = assigned_lsn; // Advance tracked LSN
+            db->current_wal_lsn = assigned_lsn;
         }
 
         size_t mem_before = memtable_get_memory_usage(db->memtable);
@@ -865,13 +860,11 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
         db->current_seq -= total_count;
     }
 
-    // [Phase 6] Ticket complete. Allow the next chronological batch to proceed.
     db->commit_ticket_tail++;
     pthread_cond_broadcast(&db->commit_cv);
 
     pthread_mutex_unlock(&db->write_mutex);
 
-    // 4. Conclude the Batch
     pthread_mutex_lock(&db->queue_mutex);
     curr = w.next;
     while (curr != NULL) {
@@ -885,7 +878,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
     }
     pthread_mutex_unlock(&db->queue_mutex);
 
-    // 5. Memory Enforcer
     if (write_success && diff > 0) {
         size_t current_usage = atomic_fetch_add(&db->env->global_mem_usage, diff) + diff;
         if (current_usage > db->env->global_mem_limit) lsm_db_force_flush(db);

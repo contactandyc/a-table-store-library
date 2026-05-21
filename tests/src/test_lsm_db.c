@@ -985,6 +985,92 @@ MACRO_TEST(db_flush_job_backs_off_and_avoids_deadlock) {
     lsm_env_destroy(env);
 }
 
+static bool simulate_disk_broken = false;
+
+static int db_toggle_fsync_file(void *f) {
+    if (simulate_disk_broken) return -1;
+    return local_posix_backend.fsync_file(f);
+}
+
+MACRO_TEST(db_failed_flush_maintains_contiguous_durability) {
+    cleanup_db();
+
+    lsm_storage_backend_t fault_vfs;
+    memcpy(&fault_vfs, &local_posix_backend, sizeof(lsm_storage_backend_t));
+    fault_vfs.fsync_file = db_toggle_fsync_file;
+
+    simulate_disk_broken = false;
+
+    lsm_wal_t *wal = pool_to_lsm_wal("/tmp/lsm_db_test_wal", 1, 2);
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &fault_vfs, &fault_vfs, 2, wal);
+
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    lsm_db_put(db, "keyA", 4, "valA", 4);
+
+    // Break disk and force flush
+    simulate_disk_broken = true;
+    lsm_db_force_flush(db);
+
+    // Wait for background job to fail and clear out
+    for (int i=0; i<10; i++) {
+        usleep(50 * 1000);
+    }
+
+    // Write newer data
+    lsm_db_put(db, "keyB", 4, "valB", 4);
+
+    // Close DB. Phase 8 will refuse to flush keyB because keyA is stranded.
+    // It will drop memory safely, but won't checkpoint WAL, leaving both A and B to recover.
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+
+    // Fix disk and reopen
+    simulate_disk_broken = false;
+    wal = pool_to_lsm_wal("/tmp/lsm_db_test_wal", 1, 2);
+    env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                       &local_posix_backend, &local_posix_backend, 2, wal);
+    db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+    lsm_env_recover_wal(env);
+
+    uint32_t vlen;
+    char *vA = lsm_db_get(db, "keyA", 4, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(vA != NULL);
+    if (vA) aml_free(vA);
+
+    char *vB = lsm_db_get(db, "keyB", 4, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(vB != NULL);
+    if (vB) aml_free(vB);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(db_zero_thread_pool_executes_synchronously) {
+    cleanup_db();
+
+    lsm_wal_t *wal = pool_to_lsm_wal("/tmp/lsm_db_test_wal", 1, 2);
+    // num_bg_threads = 0
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 0,
+                                  &local_posix_backend, &local_posix_backend, 2, wal);
+
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    lsm_db_put(db, "sync_key", 8, "sync_val", 8);
+
+    // Since pool threads = 0, this will execute synchronously and block until complete!
+    lsm_db_force_flush(db);
+
+    uint32_t vlen;
+    char *v = lsm_db_get(db, "sync_key", 8, UINT64_MAX, &vlen);
+    MACRO_ASSERT_TRUE(v != NULL);
+    if (v) aml_free(v);
+
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -1014,6 +1100,9 @@ int main(void) {
 
     MACRO_ADD(tests, db_wal_recovery_rejects_corrupted_batches);
     MACRO_ADD(tests, db_flush_job_backs_off_and_avoids_deadlock);
+
+    MACRO_ADD(tests, db_failed_flush_maintains_contiguous_durability);
+    MACRO_ADD(tests, db_zero_thread_pool_executes_synchronously);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

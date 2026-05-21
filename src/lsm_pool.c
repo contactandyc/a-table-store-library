@@ -44,7 +44,6 @@ static void *worker_loop(void *arg) {
             break;
         }
 
-        // Pop highest priority job (2 -> 1 -> 0)
         lsm_job_node_t *job_node = NULL;
         for (int p = 2; p >= 0; p--) {
             if (pool->queues[p] != NULL) {
@@ -54,14 +53,13 @@ static void *worker_loop(void *arg) {
                     pool->tails[p] = NULL;
                 }
                 pool->queued_jobs--;
-                pool->executing_jobs++; // Mark as executing while we drop the lock
+                pool->executing_jobs++;
                 break;
             }
         }
 
         pthread_mutex_unlock(&pool->queue_mutex);
 
-        // Execute outside the lock so other threads can pick up jobs!
         if (job_node) {
             job_node->func(job_node->arg);
             aml_free(job_node);
@@ -76,14 +74,19 @@ static void *worker_loop(void *arg) {
 
 lsm_pool_t *lsm_pool_init(int num_threads) {
     lsm_pool_t *pool = aml_zalloc(sizeof(lsm_pool_t));
+    if (num_threads < 0) num_threads = 0;
     pool->num_threads = num_threads;
 
     pthread_mutex_init(&pool->queue_mutex, NULL);
     pthread_cond_init(&pool->queue_cond, NULL);
 
-    pool->threads = aml_malloc(num_threads * sizeof(pthread_t));
-    for (int i = 0; i < num_threads; i++) {
-        pthread_create(&pool->threads[i], NULL, worker_loop, pool);
+    if (num_threads > 0) {
+        pool->threads = aml_malloc(num_threads * sizeof(pthread_t));
+        for (int i = 0; i < num_threads; i++) {
+            pthread_create(&pool->threads[i], NULL, worker_loop, pool);
+        }
+    } else {
+        pool->threads = NULL;
     }
 
     return pool;
@@ -91,6 +94,11 @@ lsm_pool_t *lsm_pool_init(int num_threads) {
 
 bool lsm_pool_submit(lsm_pool_t *pool, lsm_job_func_t func, void *arg, lsm_job_priority_t priority) {
     if (priority < 0 || priority > 2) priority = 0;
+
+    // [Phase 8 Fix] Reject submission cleanly if no threads exist
+    if (pool->num_threads == 0) {
+        return false;
+    }
 
     lsm_job_node_t *node = aml_zalloc(sizeof(lsm_job_node_t));
     node->func = func;
@@ -127,13 +135,14 @@ void lsm_pool_destroy(lsm_pool_t *pool) {
     pthread_cond_broadcast(&pool->queue_cond);
     pthread_mutex_unlock(&pool->queue_mutex);
 
-    for (int i = 0; i < pool->num_threads; i++) {
-        pthread_join(pool->threads[i], NULL);
+    if (pool->num_threads > 0) {
+        for (int i = 0; i < pool->num_threads; i++) {
+            pthread_join(pool->threads[i], NULL);
+        }
+        aml_free(pool->threads);
     }
 
     pthread_mutex_destroy(&pool->queue_mutex);
     pthread_cond_destroy(&pool->queue_cond);
-
-    aml_free(pool->threads);
     aml_free(pool);
 }
