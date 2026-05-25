@@ -492,6 +492,74 @@ MACRO_TEST(sstable_builder_rejects_partial_writes) {
     MACRO_ASSERT_TRUE(f == NULL);
 }
 
+MACRO_TEST(sstable_reader_rejects_corrupted_lz4_blocks) {
+    cleanup_files();
+    const char *base = "/tmp/sstable_bad_lz4";
+    sstable_builder_t *b = sstable_builder_init(base, &local_posix_backend, FILTER_NONE, 10);
+
+    char ikey[1024];
+    memcpy(ikey, "keyA", 4);
+    uint64_t trailer = (1ULL << 8) | 1 /* OP_PUT */;
+    for(int i=0; i<8; i++) ikey[4+i] = (trailer >> (i*8)) & 0xFF;
+
+    char large_val[5000];
+    memset(large_val, 'X', 5000); // Highly compressible, triggers LZ4
+
+    sstable_builder_add(b, ikey, 12, large_val, 5000);
+    sstable_builder_finish(b);
+
+    // Corrupt the data file inside the LZ4 payload directly on disk
+    char data_path[520]; snprintf(data_path, 520, "%s.data", base);
+    FILE *f = fopen(data_path, "r+b");
+    fseek(f, 15, SEEK_SET);
+    uint32_t junk = 0xFFFFFFFF;
+    fwrite(&junk, 4, 1, f);
+    fclose(f);
+
+    lsm_env_t *env = lsm_env_init(1024*1024, 1024*1024, 2, &local_posix_backend, &local_posix_backend, 2, NULL);
+    sstable_reader_t *r = sstable_reader_init(base, &local_posix_backend, env, 1, 1);
+
+    void *val = NULL;
+    uint32_t vlen;
+    int status = sstable_reader_get(r, "keyA", 4, UINT64_MAX, &val, &vlen);
+
+    // [Phase 9 Fix] The reader safely returns 0 (Not Found/Error), avoiding a crash!
+    MACRO_ASSERT_EQ_INT(status, 0);
+
+    sstable_reader_destroy(r);
+    lsm_env_destroy(env);
+}
+
+MACRO_TEST(sstable_reader_rejects_corrupted_meta_lengths) {
+    cleanup_files();
+    const char *base = "/tmp/sstable_bad_meta";
+    sstable_builder_t *b = sstable_builder_init(base, &local_posix_backend, FILTER_NONE, 10);
+
+    char ikey[1024];
+    memcpy(ikey, "keyB", 4);
+    uint64_t trailer = (1ULL << 8) | 1 /* OP_PUT */;
+    for(int i=0; i<8; i++) ikey[4+i] = (trailer >> (i*8)) & 0xFF;
+
+    sstable_builder_add(b, ikey, 12, "valB", 4);
+    sstable_builder_finish(b);
+
+    // Corrupt the meta file index_size to a massive invalid size
+    char meta_path[520]; snprintf(meta_path, 520, "%s.meta", base);
+    FILE *f = fopen(meta_path, "r+b");
+    fseek(f, 9, SEEK_SET); // Right after META + f_type + filter_len(0)
+    uint32_t bad_len = 2000 * 1024 * 1024; // 2 GB!
+    fwrite(&bad_len, 4, 1, f);
+    fclose(f);
+
+    lsm_env_t *env = lsm_env_init(1024*1024, 1024*1024, 2, &local_posix_backend, &local_posix_backend, 2, NULL);
+
+    // The reader initialization MUST cleanly return NULL instead of allocating 2GB and crashing
+    sstable_reader_t *r = sstable_reader_init(base, &local_posix_backend, env, 1, 1);
+    MACRO_ASSERT_TRUE(r == NULL);
+
+    lsm_env_destroy(env);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -507,6 +575,9 @@ int main(void) {
     MACRO_ADD(tests, sstable_bitmap_filter_allows_out_of_range_reads);
     MACRO_ADD(tests, sstable_builder_cleans_up_on_io_error);
     MACRO_ADD(tests, sstable_builder_rejects_partial_writes);
+
+    MACRO_ADD(tests, sstable_reader_rejects_corrupted_lz4_blocks);
+    MACRO_ADD(tests, sstable_reader_rejects_corrupted_meta_lengths);
 
     macro_run_all("lsm_sstable_disk_format", tests, test_count);
     return 0;

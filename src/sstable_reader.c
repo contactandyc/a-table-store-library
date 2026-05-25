@@ -1,23 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Andy Curtis <contactandyc@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
+//
+// Maintainer: Andy Curtis <contactandyc@gmail.com>
 
 #include "a-table-store-library/sstable_reader.h"
-#include "a-table-store-library/sstable_builder.h"
+#include "a-table-store-library/lsm_cache.h"
+#include "the-lz4-library/lz4/lz4.h"
+#include "the-lz4-library/xxhash.h"
+#include "a-memory-library/aml_alloc.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "the-lz4-library/lz4/lz4.h"
-#include "the-lz4-library/xxhash.h"
-#include "a-bloom-filter-library/bloom.h"
-#include "a-memory-library/aml_alloc.h"
-
-#define COMPRESS_LZ4 1
-#define TRAILER_SIZE 8
-#define MAX_KEY_SIZE 1024
-#define MAX_INTERNAL_KEY_SIZE (MAX_KEY_SIZE + TRAILER_SIZE)
-
-// --- Endianness Helpers ---
 static inline uint32_t decode_u32_le(const uint8_t *src) {
     return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
 }
@@ -27,446 +22,382 @@ static inline uint64_t decode_u64_le(const uint8_t *src) {
     return v;
 }
 
-typedef struct {
-    char *key;
-    uint32_t key_len;
-    uint64_t offset;
-    uint64_t size;
-} index_entry_t;
+static int decode_varint32(const uint8_t *src, uint32_t limit, uint32_t *value) {
+    uint32_t result = 0;
+    int shift = 0;
+    uint32_t bytes = 0;
+    while (bytes < limit && bytes < 5) {
+        uint8_t b = src[bytes++];
+        result |= (uint32_t)(b & 127) << shift;
+        if (!(b & 128)) {
+            *value = result;
+            return bytes;
+        }
+        shift += 7;
+    }
+    return 0;
+}
 
 struct sstable_reader_s {
+    char base_path[512];
     lsm_storage_backend_t *backend;
-    void *data_reader;
     lsm_env_t *env;
     uint32_t table_id;
     uint64_t file_id;
 
+    void *data_reader;
+
     int filter_type;
-    bloom_t *bloom;
     uint8_t *bitmap;
     size_t bitmap_cap;
     uint64_t min_bitmap_id;
 
-    index_entry_t *index;
-    uint32_t num_index_entries;
+    uint8_t *index_buf;
+    uint32_t index_size;
 };
-
-static inline uint32_t decode_varint32(const uint8_t **ptr, const uint8_t *end) {
-    uint32_t result = 0; int shift = 0;
-    while (*ptr < end) {
-        uint8_t byte = **ptr; (*ptr)++;
-        result |= (byte & 127) << shift;
-        if (!(byte & 128)) break;
-        shift += 7;
-    }
-    return result;
-}
 
 sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend_t *backend, lsm_env_t *env, uint32_t table_id, uint64_t file_id) {
     sstable_reader_t *r = aml_zalloc(sizeof(sstable_reader_t));
+    strncpy(r->base_path, base_path, 511);
     r->backend = backend;
     r->env = env;
     r->table_id = table_id;
     r->file_id = file_id;
 
-    char data_path[520]; snprintf(data_path, sizeof(data_path), "%s.data", base_path);
+    char data_path[520];
+    snprintf(data_path, sizeof(data_path), "%s.data", base_path);
     r->data_reader = backend->open_reader(data_path);
     if (!r->data_reader) { aml_free(r); return NULL; }
 
-    char meta_path[520]; snprintf(meta_path, sizeof(meta_path), "%s.meta", base_path);
-    void *meta_reader = backend->open_reader(meta_path);
-    if (!meta_reader) { backend->close_reader(r->data_reader); aml_free(r); return NULL; }
+    char meta_path[520];
+    snprintf(meta_path, sizeof(meta_path), "%s.meta", base_path);
+    void *meta = backend->open_reader(meta_path);
+    if (!meta) { backend->close_reader(r->data_reader); aml_free(r); return NULL; }
 
-    uint64_t current_offset = 0;
     uint8_t header[9];
-    backend->pread(meta_reader, header, 9, current_offset);
-    current_offset += 9;
-
-    if (memcmp(header, "META", 4) != 0) {
-        backend->close_reader(meta_reader); backend->close_reader(r->data_reader); aml_free(r); return NULL;
-    }
+    if (backend->pread(meta, header, 9, 0) != 9) goto fail;
+    if (memcmp(header, "META", 4) != 0) goto fail;
 
     r->filter_type = header[4];
     uint32_t filter_len = decode_u32_le(header + 5);
 
-    if (filter_len > 0) {
-        uint8_t *filter_data = aml_malloc(filter_len);
-        backend->pread(meta_reader, filter_data, filter_len, current_offset);
-        current_offset += filter_len;
+    // [Phase 9] Reject massive allocations from corrupted .meta files
+    if (filter_len > 100 * 1024 * 1024) goto fail;
 
-        if (r->filter_type == FILTER_BLOOM) {
-            r->bloom = aml_zalloc(sizeof(bloom_t));
-            r->bloom->num_bits = decode_u64_le(filter_data);
-            r->bloom->num_hashes = decode_u64_le(filter_data + 8);
-            size_t bits_bytes = (r->bloom->num_bits + 7) / 8;
-            r->bloom->bits = aml_malloc(bits_bytes);
-            memcpy(r->bloom->bits, filter_data + 16, bits_bytes);
-        } else if (r->filter_type == FILTER_BITMAP) {
-            r->min_bitmap_id = decode_u64_le(filter_data);
-            r->bitmap_cap = filter_len - 8;
-            r->bitmap = aml_malloc(r->bitmap_cap);
-            memcpy(r->bitmap, filter_data + 8, r->bitmap_cap);
+    uint64_t offset = 9;
+    if (filter_len > 0) {
+        uint8_t *fbuf = aml_malloc(filter_len);
+        if (backend->pread(meta, fbuf, filter_len, offset) != (ssize_t)filter_len) {
+            aml_free(fbuf); goto fail;
         }
-        aml_free(filter_data);
+        if (r->filter_type == 2 /* FILTER_BITMAP */) {
+            if (filter_len >= 8) {
+                r->min_bitmap_id = decode_u64_le(fbuf);
+                r->bitmap_cap = filter_len - 8;
+                r->bitmap = aml_malloc(r->bitmap_cap);
+                memcpy(r->bitmap, fbuf + 8, r->bitmap_cap);
+            }
+        }
+        aml_free(fbuf);
+        offset += filter_len;
     }
 
     uint8_t idx_sz_buf[4];
-    backend->pread(meta_reader, idx_sz_buf, 4, current_offset);
-    current_offset += 4;
-    uint32_t idx_len = decode_u32_le(idx_sz_buf);
+    if (backend->pread(meta, idx_sz_buf, 4, offset) != 4) goto fail;
+    r->index_size = decode_u32_le(idx_sz_buf);
+    offset += 4;
 
-    uint8_t *idx_data = aml_malloc(idx_len);
-    backend->pread(meta_reader, idx_data, idx_len, current_offset);
-    backend->close_reader(meta_reader);
+    // [Phase 9] Reject massive allocations from corrupted index headers
+    if (r->index_size > 256 * 1024 * 1024) goto fail;
 
-    size_t ptr = 0;
-    uint32_t cap = 1024;
-    r->index = aml_malloc(cap * sizeof(index_entry_t));
-    r->num_index_entries = 0;
-
-    while (ptr < idx_len) {
-        if (r->num_index_entries >= cap) {
-            cap *= 2;
-            r->index = aml_realloc(r->index, cap * sizeof(index_entry_t));
+    if (r->index_size > 0) {
+        r->index_buf = aml_malloc(r->index_size);
+        if (backend->pread(meta, r->index_buf, r->index_size, offset) != (ssize_t)r->index_size) {
+            goto fail;
         }
-        index_entry_t *ie = &r->index[r->num_index_entries++];
-        ie->key_len = decode_u32_le(idx_data + ptr); ptr += 4;
-
-        // Prevent allocation exploits on corrupt index files
-        if (ie->key_len > MAX_INTERNAL_KEY_SIZE) { ie->key_len = 0; break; }
-
-        ie->key = aml_malloc(ie->key_len);
-        memcpy(ie->key, idx_data + ptr, ie->key_len); ptr += ie->key_len;
-        ie->offset = decode_u64_le(idx_data + ptr); ptr += 8;
-        ie->size = decode_u64_le(idx_data + ptr); ptr += 8;
     }
 
-    aml_free(idx_data);
+    backend->close_reader(meta);
     return r;
-}
 
-int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, uint64_t read_seq_num, void **out_val, uint32_t *out_val_len) {
-    uint32_t u_len = key_len;
-    if (u_len > MAX_KEY_SIZE) return 0;
-
-    if (r->filter_type == 1 && !bloom_check(r->bloom, key, u_len)) return 0;
-
-    if (r->filter_type == 2 && u_len >= 8) {
-        uint64_t current_id;
-        memcpy(&current_id, key, 8);
-        if (current_id < r->min_bitmap_id) return 0;
-        uint64_t diff = current_id - r->min_bitmap_id;
-        size_t byte_idx = diff / 8;
-        // [Phase 3] Treat out-of-bounds as a "maybe" to prevent false negatives
-        if (byte_idx < r->bitmap_cap && !(r->bitmap[byte_idx] & (1 << (diff % 8)))) return 0;
-    }
-
-    int left = 0, right = r->num_index_entries - 1, target_idx = -1;
-    while (left <= right) {
-        int mid = left + (right - left) / 2;
-        uint32_t indexed_user_len = r->index[mid].key_len > TRAILER_SIZE ? r->index[mid].key_len - TRAILER_SIZE : 0;
-        uint32_t min_len = key_len < indexed_user_len ? key_len : indexed_user_len;
-
-        int cmp = memcmp(key, r->index[mid].key, min_len);
-        if (cmp == 0) cmp = (key_len < indexed_user_len) ? -1 : (key_len > indexed_user_len ? 1 : 0);
-
-        if (cmp <= 0) {
-            target_idx = mid;
-            right = mid - 1;
-        } else {
-            left = mid + 1;
-        }
-    }
-
-    if (target_idx == -1) return 0;
-    index_entry_t *idx = &r->index[target_idx];
-
-    // [Phase 3] Minimum possible size for an uncompressed block trailer is 9 bytes
-    if (idx->size < 9) return 0;
-
-    lsm_cache_handle_t *cache_h = lsm_cache_get(r->env->block_cache, r->table_id, r->file_id, idx->offset);
-    if (!cache_h) {
-        uint8_t *disk_buf = aml_malloc(idx->size);
-        ssize_t b_read = r->backend->pread(r->data_reader, disk_buf, idx->size, idx->offset);
-        if (b_read < 0 || (size_t)b_read != idx->size) {
-            aml_free(disk_buf);
-            return 0;
-        }
-        cache_h = lsm_cache_put_or_get(r->env->block_cache, r->table_id, r->file_id, idx->offset, disk_buf, idx->size);
-    }
-
-    uint8_t *disk_buf = (uint8_t *)lsm_cache_handle_data(cache_h, NULL);
-
-    uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
-    uint8_t flag = disk_buf[idx->size - 5];
-    uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
-
-    if (XXH32(disk_buf, idx->size - 9, 0) != file_crc) {
-        lsm_cache_handle_release(r->env->block_cache, cache_h);
-        return 0;
-    }
-
-    uint8_t *block = disk_buf;
-    size_t block_size = uncomp_size;
-
-    // [Phase 3] Enforce minimum uncompressed block sizing constraints
-    if (block_size < 4) {
-        lsm_cache_handle_release(r->env->block_cache, cache_h);
-        return 0;
-    }
-
-    uint8_t *decomp_buf = NULL;
-    if (flag == COMPRESS_LZ4) {
-        decomp_buf = aml_malloc(uncomp_size);
-        int decomp_size = LZ4_decompress_safe((const char*)disk_buf, (char*)decomp_buf, idx->size - 9, uncomp_size);
-        if (decomp_size < 0 || (uint32_t)decomp_size != uncomp_size) {
-            aml_free(decomp_buf);
-            lsm_cache_handle_release(r->env->block_cache, cache_h);
-            return 0;
-        }
-        block = decomp_buf;
-    }
-
-    uint32_t num_restarts = decode_u32_le(&block[block_size - 4]);
-
-    // [Phase 3] Prevent math overflow if num_restarts is maliciously large
-    if ((uint64_t)num_restarts * 4 > block_size - 4) {
-        if (decomp_buf) aml_free(decomp_buf);
-        lsm_cache_handle_release(r->env->block_cache, cache_h);
-        return 0;
-    }
-
-    uint32_t restarts_offset = block_size - 4 - (num_restarts * 4);
-    const uint8_t *end = block + restarts_offset;
-
-    uint32_t target_restart = 0;
-    int r_left = 0, r_right = (int)num_restarts - 1;
-    while (r_left <= r_right && num_restarts > 0) {
-        int r_mid = r_left + (r_right - r_left) / 2;
-        uint32_t offset = decode_u32_le(&block[restarts_offset + r_mid * 4]);
-
-        if (offset >= restarts_offset) break; // Bounds check
-
-        const uint8_t *p = block + offset;
-        uint32_t shared = decode_varint32(&p, end);
-        uint32_t unshared = decode_varint32(&p, end);
-        uint32_t vlen = decode_varint32(&p, end);
-
-        (void)shared;
-        (void)vlen;
-
-        uint32_t user_len = unshared > TRAILER_SIZE ? unshared - TRAILER_SIZE : 0;
-        uint32_t min_len = key_len < user_len ? key_len : user_len;
-
-        int cmp = memcmp(key, p, min_len);
-        if (cmp == 0) cmp = (key_len < user_len) ? -1 : (key_len > user_len ? 1 : 0);
-
-        if (cmp < 0) {
-            r_right = r_mid - 1;
-        } else {
-            target_restart = r_mid;
-            r_left = r_mid + 1;
-        }
-    }
-
-    uint32_t offset = decode_u32_le(&block[restarts_offset + target_restart * 4]);
-    if (offset >= restarts_offset) offset = 0; // Safeguard fallback
-    const uint8_t *ptr = block + offset;
-
-    char current_key[MAX_INTERNAL_KEY_SIZE];
-    uint32_t current_key_len = 0;
-    int status = 0;
-
-    while (ptr < end) {
-        uint32_t shared = decode_varint32(&ptr, end);
-        uint32_t unshared = decode_varint32(&ptr, end);
-        uint32_t vlen = decode_varint32(&ptr, end);
-
-        if (shared + unshared > MAX_INTERNAL_KEY_SIZE || ptr + unshared + vlen > end) {
-            break;
-        }
-
-        memcpy(current_key + shared, ptr, unshared); ptr += unshared;
-        current_key_len = shared + unshared;
-
-        uint32_t current_user_len = current_key_len > TRAILER_SIZE ? current_key_len - TRAILER_SIZE : 0;
-        uint32_t min_len = key_len < current_user_len ? key_len : current_user_len;
-
-        int cmp = memcmp(key, current_key, min_len);
-        if (cmp == 0) cmp = (key_len < current_user_len) ? -1 : (key_len > current_user_len ? 1 : 0);
-
-        if (cmp == 0) {
-            const uint8_t *t = (const uint8_t *)(current_key + current_user_len);
-            uint64_t packed = decode_u64_le(t);
-            uint64_t seq = packed >> 8;
-            uint8_t op = (uint8_t)(packed & 0xFF);
-
-            if (seq <= read_seq_num) {
-                if (op == 1) {
-                    status = -1;
-                } else {
-                    *out_val = aml_malloc(vlen);
-                    memcpy(*out_val, ptr, vlen);
-                    if (out_val_len) *out_val_len = vlen;
-                    status = 1;
-                }
-                break;
-            }
-        } else if (cmp < 0) break;
-        ptr += vlen;
-    }
-
-    if (decomp_buf) aml_free(decomp_buf);
-    lsm_cache_handle_release(r->env->block_cache, cache_h);
-    return status;
+fail:
+    if (meta) backend->close_reader(meta);
+    if (r->data_reader) backend->close_reader(r->data_reader);
+    if (r->bitmap) aml_free(r->bitmap);
+    if (r->index_buf) aml_free(r->index_buf);
+    aml_free(r);
+    return NULL;
 }
 
 void sstable_reader_destroy(sstable_reader_t *r) {
     if (!r) return;
-    r->backend->close_reader(r->data_reader);
-    if (r->bloom) bloom_destroy(r->bloom);
+    if (r->data_reader) r->backend->close_reader(r->data_reader);
     if (r->bitmap) aml_free(r->bitmap);
-    for (uint32_t i = 0; i < r->num_index_entries; i++) {
-        if (r->index[i].key_len > 0) aml_free(r->index[i].key);
-    }
-    aml_free(r->index);
+    if (r->index_buf) aml_free(r->index_buf);
     aml_free(r);
 }
 
-// [Phase 3] Strongly-typed iterator cache tracking
+static lsm_cache_handle_t *sstable_reader_load_block(sstable_reader_t *r, uint64_t offset, uint64_t disk_size) {
+    lsm_cache_handle_t *h = lsm_cache_get(r->env->block_cache, r->table_id, r->file_id, offset);
+    if (h) return h;
+
+    // [Phase 9] Strict block size boundaries
+    if (disk_size < 9 || disk_size > 128 * 1024 * 1024) return NULL;
+
+    uint8_t *disk_buf = aml_malloc(disk_size);
+    if (r->backend->pread(r->data_reader, disk_buf, disk_size, offset) != (ssize_t)disk_size) {
+        aml_free(disk_buf); return NULL;
+    }
+
+    uint32_t uncomp_size = decode_u32_le(disk_buf + disk_size - 9);
+    uint8_t comp_flag = disk_buf[disk_size - 5];
+    uint32_t checksum = decode_u32_le(disk_buf + disk_size - 4);
+
+    if (XXH32(disk_buf, disk_size - 9, 0) != checksum) {
+        aml_free(disk_buf); return NULL;
+    }
+
+    uint8_t *uncomp_buf = NULL;
+
+    if (comp_flag == 0 /* COMPRESS_NONE */) {
+        // [Phase 9] Strict sizing enforcing: uncompressed size MUST perfectly match data payload
+        if (uncomp_size != disk_size - 9) {
+            aml_free(disk_buf); return NULL;
+        }
+        uncomp_buf = aml_malloc(uncomp_size);
+        memcpy(uncomp_buf, disk_buf, uncomp_size);
+    } else if (comp_flag == 1 /* COMPRESS_LZ4 */) {
+        if (uncomp_size > 128 * 1024 * 1024) { aml_free(disk_buf); return NULL; }
+        uncomp_buf = aml_malloc(uncomp_size);
+
+        // [Phase 9] Secure Signed Decompression Casts & Strict Error Checking
+        int dec_bytes = LZ4_decompress_safe((const char*)disk_buf, (char*)uncomp_buf, disk_size - 9, uncomp_size);
+
+        if (dec_bytes < 0 || (uint32_t)dec_bytes != uncomp_size) {
+            aml_free(disk_buf);
+            aml_free(uncomp_buf);
+            return NULL;
+        }
+    } else {
+        aml_free(disk_buf); return NULL;
+    }
+
+    aml_free(disk_buf);
+    h = lsm_cache_put_or_get(r->env->block_cache, r->table_id, r->file_id, offset, uncomp_buf, uncomp_size);
+    return h;
+}
+
+int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, uint64_t read_seq_num, void **out_val, uint32_t *out_vlen) {
+    if (r->filter_type == 2 /* FILTER_BITMAP */ && key_len >= 8 && r->bitmap) {
+        uint64_t current_id;
+        memcpy(&current_id, key, 8);
+        if (current_id < r->min_bitmap_id) return 0;
+
+        uint64_t diff = current_id - r->min_bitmap_id;
+        size_t byte_idx = diff / 8;
+        if (byte_idx < r->bitmap_cap) {
+            if (!(r->bitmap[byte_idx] & (1 << (diff % 8)))) {
+                return 0; // Filter mathematical rejection
+            }
+        }
+    }
+
+    uint32_t ptr = 0;
+    uint64_t target_block_offset = UINT64_MAX;
+    uint64_t target_block_size = 0;
+
+    while (ptr < r->index_size) {
+        if (ptr + 4 > r->index_size) break;
+        uint32_t iklen = decode_u32_le(r->index_buf + ptr); ptr += 4;
+
+        if (ptr + iklen + 16 > r->index_size) break;
+
+        uint32_t ulen = iklen > 8 ? iklen - 8 : 0;
+        uint32_t min_len = key_len < ulen ? key_len : ulen;
+
+        int cmp = memcmp(key, r->index_buf + ptr, min_len);
+        if (cmp == 0) cmp = key_len < ulen ? -1 : (key_len > ulen ? 1 : 0);
+
+        uint64_t offset = decode_u64_le(r->index_buf + ptr + iklen);
+        uint64_t disk_sz = decode_u64_le(r->index_buf + ptr + iklen + 8);
+
+        ptr += iklen + 16;
+
+        if (cmp <= 0) {
+            target_block_offset = offset;
+            target_block_size = disk_sz;
+            break;
+        }
+    }
+
+    if (target_block_offset == UINT64_MAX) return 0;
+
+    lsm_cache_handle_t *h = sstable_reader_load_block(r, target_block_offset, target_block_size);
+    if (!h) return 0; // Missing or corrupted block cleanly returned as 'Not Found' instead of crashing
+
+    size_t block_size_st;
+    uint8_t *block_buf = (uint8_t *)lsm_cache_handle_data(h, &block_size_st);
+    uint32_t block_size = (uint32_t)block_size_st;
+
+    if (block_size < 4) { lsm_cache_handle_release(r->env->block_cache, h); return 0; }
+    uint32_t num_restarts = decode_u32_le(block_buf + block_size - 4);
+
+    // [Phase 9] Prevent unsigned math underflow! Cast to uint64_t for the check
+    if (num_restarts == 0 || ((uint64_t)num_restarts * 4) > (block_size - 4)) {
+        lsm_cache_handle_release(r->env->block_cache, h);
+        return 0; // Clean rejection of bounds-busting integer injection
+    }
+
+    uint32_t restarts_offset = block_size - 4 - (num_restarts * 4);
+    uint32_t bptr = 0;
+    char last_key[1024];
+    uint32_t last_key_len = 0;
+
+    while (bptr < restarts_offset) {
+        uint32_t shared, unshared, vlen;
+        int s_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &shared); bptr += s_b;
+        int u_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &unshared); bptr += u_b;
+        int v_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &vlen); bptr += v_b;
+
+        if (s_b == 0 || u_b == 0 || v_b == 0 || bptr + unshared + vlen > restarts_offset) break;
+        if (shared + unshared > 1024) break;
+
+        memcpy(last_key + shared, block_buf + bptr, unshared);
+        bptr += unshared;
+        last_key_len = shared + unshared;
+
+        const uint8_t *val_ptr = block_buf + bptr;
+        bptr += vlen;
+
+        uint32_t ulen = last_key_len > 8 ? last_key_len - 8 : 0;
+        uint32_t min_len = key_len < ulen ? key_len : ulen;
+        int cmp = memcmp(key, last_key, min_len);
+        if (cmp == 0) cmp = key_len < ulen ? -1 : (key_len > ulen ? 1 : 0);
+
+        if (cmp == 0) {
+            uint64_t seq = decode_u64_le((const uint8_t*)last_key + ulen) >> 8;
+            uint8_t op = last_key[last_key_len - 8];
+            if (seq <= read_seq_num) {
+                if (op == 1 /* OP_DELETE */) {
+                    lsm_cache_handle_release(r->env->block_cache, h);
+                    return -1;
+                }
+                *out_val = aml_malloc(vlen);
+                memcpy(*out_val, val_ptr, vlen);
+                *out_vlen = vlen;
+                lsm_cache_handle_release(r->env->block_cache, h);
+                return 1;
+            }
+        } else if (cmp < 0) {
+            break;
+        }
+    }
+
+    lsm_cache_handle_release(r->env->block_cache, h);
+    return 0;
+}
+
 struct sstable_iter_s {
-    sstable_reader_t *reader;
-    uint32_t current_block_idx;
-    lsm_cache_handle_t *cached_handle;
+    sstable_reader_t *r;
+    uint32_t index_ptr;
 
-    uint8_t *current_block_buf;
-    size_t current_block_size;
-    bool owns_block_buf;
+    lsm_cache_handle_t *handle;
+    uint8_t *block_buf;
+    uint32_t block_size;
+    uint32_t restarts_offset;
 
-    const uint8_t *ptr;
-    const uint8_t *end;
-    char current_key[MAX_INTERNAL_KEY_SIZE];
-    uint32_t current_key_len;
-    const char *current_val;
-    uint32_t current_val_len;
+    uint32_t block_ptr;
+    char key[1024];
+    uint32_t key_len;
+    const char *val;
+    uint32_t val_len;
 };
 
-static bool iter_load_next_block(sstable_iter_t *iter) {
-    if (iter->current_block_idx >= iter->reader->num_index_entries) return false;
+sstable_iter_t *sstable_iter_init(sstable_reader_t *r) {
+    sstable_iter_t *it = aml_zalloc(sizeof(sstable_iter_t));
+    it->r = r;
+    return it;
+}
 
-    if (iter->cached_handle != NULL) {
-        lsm_cache_handle_release(iter->reader->env->block_cache, iter->cached_handle);
-        iter->cached_handle = NULL;
-    }
+bool sstable_iter_next(sstable_iter_t *it) {
+    while (true) {
+        if (it->handle && it->block_ptr < it->restarts_offset) {
+            uint32_t shared, unshared, vlen;
+            int s_b = decode_varint32(it->block_buf + it->block_ptr, it->restarts_offset - it->block_ptr, &shared); it->block_ptr += s_b;
+            int u_b = decode_varint32(it->block_buf + it->block_ptr, it->restarts_offset - it->block_ptr, &unshared); it->block_ptr += u_b;
+            int v_b = decode_varint32(it->block_buf + it->block_ptr, it->restarts_offset - it->block_ptr, &vlen); it->block_ptr += v_b;
 
-    index_entry_t *idx = &iter->reader->index[iter->current_block_idx++];
+            if (s_b == 0 || u_b == 0 || v_b == 0 || it->block_ptr + unshared + vlen > it->restarts_offset) break;
+            if (shared + unshared > 1024) break;
 
-    // [Phase 3] Enforce minimum physical disk size bounds
-    if (idx->size < 9) return false;
+            memcpy(it->key + shared, it->block_buf + it->block_ptr, unshared);
+            it->block_ptr += unshared;
+            it->key_len = shared + unshared;
 
-    lsm_cache_handle_t *cache_h = lsm_cache_get(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, idx->offset);
-    if (!cache_h) {
-        uint8_t *disk_buf = aml_malloc(idx->size);
-        ssize_t b_read = iter->reader->backend->pread(iter->reader->data_reader, disk_buf, idx->size, idx->offset);
-        if (b_read < 0 || (size_t)b_read != idx->size) {
-            aml_free(disk_buf);
-            return false;
+            it->val = (const char*)(it->block_buf + it->block_ptr);
+            it->val_len = vlen;
+            it->block_ptr += vlen;
+
+            return true;
         }
-        cache_h = lsm_cache_put_or_get(iter->reader->env->block_cache, iter->reader->table_id, iter->reader->file_id, idx->offset, disk_buf, idx->size);
+
+        if (it->index_ptr >= it->r->index_size) return false;
+
+        if (it->index_ptr + 4 > it->r->index_size) return false;
+        uint32_t iklen = decode_u32_le(it->r->index_buf + it->index_ptr);
+        it->index_ptr += 4;
+
+        if (it->index_ptr + iklen + 16 > it->r->index_size) return false;
+        it->index_ptr += iklen;
+
+        uint64_t offset = decode_u64_le(it->r->index_buf + it->index_ptr);
+        uint64_t disk_sz = decode_u64_le(it->r->index_buf + it->index_ptr + 8);
+        it->index_ptr += 16;
+
+        if (it->handle) {
+            lsm_cache_handle_release(it->r->env->block_cache, it->handle);
+            it->handle = NULL;
+        }
+
+        it->handle = sstable_reader_load_block(it->r, offset, disk_sz);
+        if (!it->handle) return false; // Corrupted, skip it and gracefully exit
+
+        size_t iter_block_sz;
+        it->block_buf = (uint8_t*)lsm_cache_handle_data(it->handle, &iter_block_sz);
+        it->block_size = (uint32_t)iter_block_sz;
+
+        if (it->block_size < 4) continue;
+        uint32_t num_restarts = decode_u32_le(it->block_buf + it->block_size - 4);
+
+        // [Phase 9] Prevent unsigned math underflow! Cast to uint64_t for the check
+        if (num_restarts == 0 || ((uint64_t)num_restarts * 4) > (it->block_size - 4)) {
+            continue;
+        }
+
+        it->restarts_offset = it->block_size - 4 - (num_restarts * 4);
+        it->block_ptr = 0;
     }
-
-    iter->cached_handle = cache_h;
-    uint8_t *disk_buf = (uint8_t *)lsm_cache_handle_data(cache_h, NULL);
-
-    uint32_t uncomp_size = decode_u32_le(&disk_buf[idx->size - 9]);
-    uint8_t flag = disk_buf[idx->size - 5];
-    uint32_t file_crc = decode_u32_le(&disk_buf[idx->size - 4]);
-
-    if (XXH32(disk_buf, idx->size - 9, 0) != file_crc) {
-        return false;
-    }
-
-    if (iter->owns_block_buf && iter->current_block_buf) {
-        aml_free(iter->current_block_buf);
-    }
-    iter->current_block_buf = NULL;
-
-    if (flag == COMPRESS_LZ4) {
-        iter->current_block_buf = aml_malloc(uncomp_size);
-        iter->current_block_size = LZ4_decompress_safe((const char*)disk_buf, (char*)iter->current_block_buf, idx->size - 9, uncomp_size);
-        iter->owns_block_buf = true;
-    } else {
-        iter->current_block_buf = disk_buf;
-        iter->current_block_size = uncomp_size;
-        iter->owns_block_buf = false;
-    }
-
-    // [Phase 3] Prevent num_restarts mathematical underflow vulnerabilities
-    if (iter->current_block_size < 4) return false;
-    uint32_t num_restarts = decode_u32_le(&iter->current_block_buf[iter->current_block_size - 4]);
-    if ((uint64_t)num_restarts * 4 > iter->current_block_size - 4) return false;
-
-    uint32_t restarts_offset = iter->current_block_size - 4 - (num_restarts * 4);
-
-    iter->ptr = iter->current_block_buf;
-    iter->end = iter->current_block_buf + restarts_offset;
-    return true;
+    return false;
 }
 
-sstable_iter_t *sstable_iter_init(sstable_reader_t *reader) {
-    sstable_iter_t *iter = aml_zalloc(sizeof(sstable_iter_t));
-    iter->reader = reader;
-    iter->cached_handle = NULL;
-    iter->owns_block_buf = false;
-    return iter;
+void sstable_iter_get_kv(sstable_iter_t *it, const char **key, uint32_t *klen, const char **val, uint32_t *vlen) {
+    *key = it->key;
+    *klen = it->key_len;
+    *val = it->val;
+    *vlen = it->val_len;
 }
 
-bool sstable_iter_next(sstable_iter_t *iter) {
-    while (!iter->ptr || iter->ptr >= iter->end) {
-        if (!iter_load_next_block(iter)) return false;
-    }
-
-    uint32_t shared = decode_varint32(&iter->ptr, iter->end);
-    uint32_t unshared = decode_varint32(&iter->ptr, iter->end);
-    uint32_t vlen = decode_varint32(&iter->ptr, iter->end);
-
-    if (shared + unshared > MAX_INTERNAL_KEY_SIZE || iter->ptr + unshared + vlen > iter->end) {
-        return false;
-    }
-
-    memcpy(iter->current_key + shared, iter->ptr, unshared);
-    iter->ptr += unshared;
-    iter->current_key_len = shared + unshared;
-
-    iter->current_val = (const char *)iter->ptr;
-    iter->current_val_len = vlen;
-    iter->ptr += vlen;
-    return true;
+void sstable_iter_get_meta(sstable_iter_t *it, uint64_t *seq, uint8_t *op) {
+    if (it->key_len < 8) { *seq=0; *op=0; return; }
+    uint64_t trailer = decode_u64_le((const uint8_t*)it->key + it->key_len - 8);
+    *seq = trailer >> 8;
+    *op = trailer & 0xFF;
 }
 
-void sstable_iter_get_kv(sstable_iter_t *iter, const char **key, uint32_t *klen, const char **val, uint32_t *vlen) {
-    *key = iter->current_key; *klen = iter->current_key_len;
-    *val = iter->current_val; *vlen = iter->current_val_len;
-}
-
-void sstable_iter_get_meta(sstable_iter_t *iter, uint64_t *seq, uint8_t *op) {
-    if (iter->current_key_len >= 8) {
-        const uint8_t *t = (const uint8_t*)(iter->current_key + iter->current_key_len - 8);
-        uint64_t packed = decode_u64_le(t);
-        *seq = packed >> 8;
-        *op = (uint8_t)(packed & 0xFF);
-    } else {
-        *seq = 0; *op = 0;
+void sstable_iter_destroy(sstable_iter_t *it) {
+    if (!it) return;
+    if (it->handle) {
+        lsm_cache_handle_release(it->r->env->block_cache, it->handle);
     }
-}
-
-void sstable_iter_destroy(sstable_iter_t *iter) {
-    if (!iter) return;
-    if (iter->cached_handle != NULL) {
-        lsm_cache_handle_release(iter->reader->env->block_cache, iter->cached_handle);
-    }
-    if (iter->owns_block_buf && iter->current_block_buf) {
-        aml_free(iter->current_block_buf);
-    }
-    aml_free(iter);
+    aml_free(it);
 }

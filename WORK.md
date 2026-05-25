@@ -88,12 +88,14 @@ This phase focused on protecting the database against state drift and permanent 
 
 ### Phase 9: Parser Hardening & Math Overflows
 
-*Focus: Eliminating the remaining P1 fuzzing vulnerabilities in SSTable and Manifest IO.*
+This phase targeted the remaining data structure boundaries and LZ4 decompression logic to mathematically secure the engine against malicious fuzzing, malformed tables, and Out-Of-Memory (OOM) exploits.
 
-* **Secure Decompression Casts:** Fix the bug in the SSTable iterator where `LZ4_decompress_safe` (which returns a signed `int`) is assigned directly to an unsigned `size_t` before checking for `< 0`.
-* **Strict Block Sizing:** Enforce `uncomp_size == idx->size - 9` for uncompressed blocks to prevent buffer overlaps.
-* **Manifest Uninitialized Memory Fencing:** Use `aml_zalloc` when allocating `a_files` arrays during manifest replay so that the cleanup loop doesn't attempt to `free()` garbage pointers if parsing fails halfway through.
-* **Math & Bounds Checking:** Validate all `pread` bounds, `filter_len`, and `idx_len` constraints during `sstable_reader_init`. Use overflow-safe `uint64_t` math for `blob_size`, `payload_len`, and `record_len` calculations.
+* **Mathematical Underflow Protection:** Fixed a critical bounds-checking bypass where malicious data could inject maximum integers (e.g., `0x7FFFFFFF`) for `num_restarts`. Upgraded the validation logic to use secure 64-bit casting, ensuring the reader correctly intercepts bounds-busting integers without wrapping around.
+* **Secure Decompression Casts:** Addressed an unsafe cast where `LZ4_decompress_safe` (which returns a signed `int`) was evaluated against an unsigned size. The engine now strictly validates that the decompression output perfectly matches the expected `uncomp_size` and securely handles negative error codes.
+* **Strict Block & Meta Sizing Limits:** Placed hard caps on memory allocations when reading metadata and indexes (rejecting allocations over 256MB) and block decompression (capped at 128MB). This immunizes the `sstable_reader_init` sequence against OOM crashes caused by corrupt or tampered file headers.
+* **Uncompressed Block Invariants:** Hardened the block loading mechanism to enforce that `uncomp_size` precisely equals `disk_size - 9` for uncompressed blocks, instantly rejecting files with missing or trailing garbage bytes.
+* **Manifest Uninitialized Memory Fencing:** Switched to zero-initialized allocations (`aml_zalloc`) when parsing the `a_files` arrays during manifest replay. This guarantees that if the parser bails out midway due to corruption, the error-handling sequence will not trigger Segfaults by attempting to free garbage pointers.
+* **Adversarial Fuzz Testing:** Added robust tests (`sstable_reader_rejects_corrupted_lz4_blocks` and `sstable_reader_rejects_corrupted_meta_lengths`) that explicitly inject invalid payload sizes and corrupted LZ4 data into physical files, proving the reader gracefully skips corrupted blocks without crashing.
 
 ### Phase 10: Advanced Fault Verification (Testing)
 
