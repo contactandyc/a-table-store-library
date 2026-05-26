@@ -1,97 +1,109 @@
-# a-table-store-library
+# Architectural Blueprint: Cloud-Scale LSM Tree & WAL
 
-`a-table-store-library` is an embedded key-value storage engine implemented in C. It is built upon a Log-Structured Merge-Tree (LSM-Tree) architecture, designed to handle write-heavy workloads and provide a persistent storage layer for higher-level execution engines (such as a SQL Virtual Machine).
+At a high level, an LSM Tree paired with a WAL optimizes for massive write throughput while maintaining strict durability and efficient reads. The system absorbs random writes into memory, sequences them for concurrency control, strictly logs them for durability, and flushes them to immutable disk files in the background.
 
-Because it is embedded, it runs directly within your application's process and manages its own directory of files on disk.
+Building this at "cloud scale" requires surviving multi-tenant resource contention, hardware degradation, disk I/O bottlenecks, and sudden power failures without data loss or system deadlocks.
 
-## Architecture & Features (Why use it)
+---
 
-LSM-Trees trade sequential disk write performance against read amplification. Rather than updating records in-place (like a B-Tree), all writes are buffered in memory and sequentially flushed to immutable files.
+## 1. The Write-Ahead Log (WAL) & Durability
 
-This library implements standard industry techniques to manage this data lifecycle:
+Before any data is exposed to the database's memory structures, it is sequentially appended to the persistent WAL. The WAL acts as the absolute source of truth for crash recovery.
 
-* **MVCC (Multi-Version Concurrency Control):** The engine does not overwrite data. Keys are packed with a 56-bit sequence number and an 8-bit operation type (PUT or DELETE). This allows for point-in-time snapshots and non-blocking reads.
-* **MemTable:** Active writes are absorbed into a lock-free SkipList in RAM. Once a memory limit is reached, it is flushed to disk.
-* **SSTables (Sorted String Tables):** Data is flushed to disk as immutable, strictly sorted files. The files are divided into 16KB data blocks utilizing **LZ4 compression** and **prefix delta-encoding** to minimize storage footprints.
-* **Read Optimizations:** Each SSTable contains an embedded **Bloom Filter** (using xxHash) and a sparse Index Block. Point lookups can often reject missing keys with zero disk I/O, or locate the exact compressed block with a single read.
-* **Leveled Compaction:** A background process monitors file sizes and counts. When thresholds are crossed, it performs an N-Way Merge to push data into lower levels (L0 → L6), dropping deleted records (tombstones) and older versions to reclaim space and maintain read performance.
-* **Global Merging Iterator:** The library provides an iterator that merges the active MemTable, L0, and L1+ files in real-time using a Priority Min-Heap. It automatically strips MVCC metadata, yielding a contiguous, strictly sorted stream of the newest valid records.
+**Functionality:**
 
-## Usage (How to use it)
+* **Sequential Append-Only Logging:** Incoming mutations are serialized into continuous log frames on disk.
+* **Segment Rotation & Standby Pools:** Because WAL files grow indefinitely, the log is broken into "segments." Once a segment hits a size threshold, it rotates. Instead of deleting old segments, they are recycled into a "standby pool" of pre-allocated files.
+* **Global Sequence/LSN Tracking:** A unified Logical Sequence Number (LSN) allows multiple tables or database shards to safely multiplex their writes into a single shared WAL, drastically reducing disk seeks.
 
-The primary interface is exposed through `lsm_db.h`. The engine treats both keys and values as opaque byte arrays (`void*`), meaning you must serialize your structures before insertion.
+**Challenges & Edge Cases Addressed:**
 
-### 1. Initialization and Cleanup
+* **I/O Bottlenecks via Group Commit:** Forcing an `fsync` to disk for every concurrent write limits throughput to the physical hardware's IOPS. Instead, concurrent writers queue up. A "leader" thread batches all pending writes into a single contiguous super-batch, issues one sequential disk write, and wakes up all followers simultaneously.
+* **Torn Writes and Bit Rot:** A sudden power loss can leave a WAL frame partially written. Every frame is wrapped with an exact byte-length and a CRC32 checksum. During recovery, partial frames or mismatched checksums are safely detected and truncated rather than crashing the system.
+* **Cross-Table Garbage Collection:** The WAL can only safely purge old segments when *all* multiplexed tables have successfully flushed their memory to disk. This is managed via global LSN checkpoint watermarks to ensure no table loses un-flushed data.
 
-Open the database by providing a directory path and a maximum memory limit for the MemTable (e.g., 64MB). If the directory does not exist, you must create it prior to calling `lsm_db_open`.
+---
 
-```c
-#include "a-table-store-library/lsm_db.h"
+## 2. In-Memory Store (MemTable) & Allocation
 
-// Open DB with a 64MB MemTable limit
-lsm_db_t *db = lsm_db_open("/var/data/my_database", 64 * 1024 * 1024);
+Once a write is secure in the WAL, it is inserted into an in-memory data structure (typically a lock-free SkipList) called a MemTable. This keeps data perfectly sorted and available for immediate querying in $O(\log N)$ time.
 
-// ... perform operations ...
+**Functionality:**
 
-// Safely flushes remaining memory to disk and cleans up
-lsm_db_close(db);
+* **Multi-Version Concurrency Control (MVCC):** Reads must not block writes. Every write is tagged with a monotonically increasing Sequence Number and an Operation Type (Put vs. Delete). Updates do not overwrite old data; they are appended.
+* **Active vs. Immutable States:** When a MemTable hits its memory limit, it is frozen into an "Immutable" state. A new Active MemTable takes over incoming writes while a background thread safely flushes the immutable one to disk.
 
-```
+**Challenges & Edge Cases Addressed:**
 
-### 2. Point Operations (CRUD)
+* **Allocation Fragmentation (Arena Allocator):** Calling standard `malloc` for millions of individual key-value rows heavily fragments RAM and destroys CPU cache locality. The system uses a Geometric Arena Allocator—requesting massive contiguous chunks from the OS (e.g., doubling from 128KB up to 4MB) and dispensing memory via a blazing-fast atomic pointer increment.
+* **Tombstone Shadowing:** Deleting a record inserts a "Tombstone" marker rather than removing memory. The search logic must correctly interpret tombstones to mask older values on disk, preventing "ghost reads."
+* **Snapshot Isolation:** Long-running queries bind to a specific snapshot sequence. The read path must cleanly ignore keys with a sequence number strictly greater than the requested snapshot, guaranteeing repeatable reads.
 
-Standard key-value operations. Note that `lsm_db_delete` does not immediately remove the data from disk; it inserts a tombstone marker that shadows older records until they are garbage collected during compaction.
+---
 
-```c
-int user_id = 42;
-const char *user_data = "{\"name\": \"Alice\", \"age\": 30}";
-uint32_t val_len = strlen(user_data) + 1; // Include null terminator
+## 3. Persistent Storage Format (SSTables)
 
-// Insert or Update
-lsm_db_put(db, &user_id, sizeof(int), user_data, val_len);
+When an Immutable MemTable is flushed to disk, it is serialized into a Sorted String Table (SSTable). These files are strictly immutable, meaning readers never need to acquire locks to scan them.
 
-// Delete
-lsm_db_delete(db, &user_id, sizeof(int));
+**Functionality:**
 
-// Retrieve
-uint32_t out_len;
-void *result = lsm_db_get(db, &user_id, sizeof(int), &out_len);
-if (result) {
-    printf("Found: %s\n", (char *)result);
-    free(result); // Caller is responsible for freeing the returned memory
-}
+* **Block-Based Compression:** Data is clustered into blocks (e.g., 16KB). Each block compresses its contents (e.g., via LZ4) and appends a checksum.
+* **Prefix Compression:** Because keys are sorted, adjacent keys often share a prefix (e.g., `user/123`, `user/124`). The SSTable stores only the differing bytes. "Restart points" are embedded periodically to allow fast binary searching without sequentially decompressing the whole block.
+* **Probabilistic Filters:** SSTable metadata includes Bloom Filters (or Bitmaps for integer keys) to mathematically prove a key's absence, allowing the system to bypass expensive disk reads.
 
-```
+**Challenges & Edge Cases Addressed:**
 
-### 3. Iteration (Table Scans)
+* **Malicious or Corrupted Data Attacks (OOM Defense):** If a flipped bit on disk alters a "varint length" header to claim a payload is 2GB, naive readers will attempt to `malloc(2GB)` and instantly crash the server. Production readers strictly validate all parsed lengths and restart arrays against exact file boundaries, gracefully returning a "Corrupt Block" error instead of segfaulting.
+* **Integer Underflows:** Mathematical filters (like Bitmaps relying on integer deltas) must be immune to unexpected key patterns or negative integer underflows that cause out-of-bounds array access.
+* **Partial Disk Failures (ENOSPC):** Disks can fill up mid-flush. The builder must verify exact-byte returns on every I/O call. If an OS write returns fewer bytes than requested, the builder explicitly aborts and physically deletes the orphaned `.data` and `.meta` files to maintain contiguous durability.
 
-The iterator provides a unified view of the database. It is essential for operations like `SELECT * FROM table`, range scans, or bridging the storage layer to a SQL execution engine.
+---
 
-```c
-lsm_db_iter_t *iter = lsm_db_iter_init(db);
+## 4. The Read Path & Block Caching
 
-const void *key;
-const void *val;
-uint32_t klen, vlen;
+Reading data requires querying the Active MemTable, Immutable MemTable, and then binary-searching the SSTables on disk from newest to oldest.
 
-// lsm_db_iter_next automatically hides deleted records and older versions
-while (lsm_db_iter_next(iter, &key, &klen, &val, &vlen)) {
-    int current_id;
-    memcpy(&current_id, key, sizeof(int));
-    
-    printf("ID: %d | Data: %s\n", current_id, (const char *)val);
-}
+**Functionality:**
 
-lsm_db_iter_destroy(iter);
+* **Block Cache:** Uncompressed disk blocks are kept in RAM using a Least Recently Used (LRU) eviction policy to drastically speed up repetitive queries.
+* **Unified Iteration:** Iterators merge the in-memory SkipLists with the on-disk SSTable streams using a Min-Heap, presenting a single, unified, chronological view of the data to the user.
 
-```
+**Challenges & Edge Cases Addressed:**
 
-## Internal Module Layout
+* **Cache Lock Contention:** A single global lock on a cache destroys multi-core scalability. The LRU Cache must be heavily sharded (e.g., 64 independent mutexes and hash maps).
+* **Cache Stampedes (Thundering Herd):** If 100 threads request the same missing disk block simultaneously, 100 expensive disk reads would trigger. The cache must deduplicate concurrent misses—the first thread issues the I/O, and racing threads resolve to the newly shared pointer.
+* **Safe Eviction (Use-After-Free):** Evicting a block while an active iterator is scanning it causes fatal errors. Cache lookups must return a "Pinned" reference count. The LRU eviction algorithm strictly bypasses pinned blocks.
 
-If you wish to modify the engine or understand its internals, the codebase is separated into strict boundaries:
+---
 
-* **`memtable.c`**: In-memory SkipList. Formats user keys into Internal Keys (appending SeqNum and OpType).
-* **`sstable_builder.c`**: Handles block chunking, compression, index generation, and bloom filter creation. Splits output files when they reach `TARGET_FILE_SIZE` (default 2MB).
-* **`sstable_reader.c`**: Memory-maps or caches SSTable footers, performing point-lookups and sequential iteration over compressed blocks.
-* **`lsm_compaction.c`**: Contains the Database Manifest (tracking which files exist in which level). Manages overlap detection and executes the N-Way Merge algorithm.
-* **`lsm_db.c`**: The orchestrator. Assigns sequence numbers, routes writes to the MemTable, triggers background flushes/compactions, and manages the unified Min-Heap iterator.
+## 5. Background Compaction & Versioning
+
+Because flushes continually create new SSTables, reading a single key might require searching dozens of overlapping files (Read Amplification). Compaction is a background process that merges overlapping SSTables, drops obsolete data, and writes out clean files to deeper, exponentially larger "Levels."
+
+**Functionality:**
+
+* **Leveled Architecture:** The disk is divided into Levels (L0 to L6). L0 contains overlapping files flushed directly from memory. L1+ contains strictly non-overlapping key ranges.
+* **The Manifest:** Because files are immutable, compactions create new files and delete old ones. The database's layout is tracked via a Manifest log. File additions and deletions are grouped into an atomic `VersionEdit`.
+
+**Challenges & Edge Cases Addressed:**
+
+* **Compaction Starvation:** If the database only ever compacts the newest overlapping files, older stranded keys might never be compacted, causing tombstone bloat. "Compaction Pointers" record the last compacted key for each level, ensuring a fair round-robin progression across the keyspace.
+* **Safe Tombstone Dropping:** A tombstone cannot be dropped just because it is old. It can only be permanently purged if it reaches the absolute bottom-most level of the LSM-tree (meaning no older shadowed data exists below it) AND there are no active MVCC Read Snapshots that might still need to see the deletion.
+* **Crash-Safe State Transitions:** If a node crashes mid-compaction, the boot-up sequence compares physical disk files against the exact list in the secured Manifest log and safely deletes unreferenced garbage.
+
+---
+
+## 6. Global Concurrency & Resource Orchestration
+
+A production engine must safely orchestrate hundreds of threads, memory limits, and state transitions without deadlocking or CPU thrashing.
+
+**Functionality:**
+
+* **Priority Thread Pooling:** Background tasks have strict priorities. A MemTable flush is **Urgent** (prevents database stalls). L0 compaction is **High** (clears hot local disk files), and deep-level compactions are **Low**.
+* **Global Memory Accounting:** Memory usage across all tables is tracked globally to ensure the node stays within its provisioned cloud boundaries.
+
+**Challenges & Edge Cases Addressed:**
+
+* **Memory Exhaustion (Write Stalls):** If writes come in faster than the disk can flush, memory will eventually be exhausted. As memory approaches a "soft limit," writer threads are subjected to micro-stalls. If a hard limit is hit, writers are safely blocked via Condition Variables until background flushes catch up.
+* **Priority Inversion:** If low-level compactions tie up all background threads, a critical MemTable flush might be delayed, causing a Write Stall. Strict priority queues ensure flushes always preempt compactions.
+* **Graceful Teardown Deadlocks:** Shutting down a high-performance database is notoriously difficult. If the shutdown sequence holds a lock that a background flush thread needs to report completion, the system deadlocks forever. The architecture uses strict separation of "Operation Leases" (active reads) and "Ownership References" (structural pointers). A shutdown safely stops new traffic, waits via Condition Variables for active jobs to drain, dumps final memory synchronously, and only then tears down the pointers.
