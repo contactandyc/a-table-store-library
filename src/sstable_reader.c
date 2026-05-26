@@ -13,6 +13,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+// [Phase 11] Support legal 1024-byte user keys globally
+#define MAX_KEY_SIZE 1024
+#define INTERNAL_KEY_TRAILER_SIZE 8
+#define MAX_INTERNAL_KEY_SIZE (MAX_KEY_SIZE + INTERNAL_KEY_TRAILER_SIZE)
+
 static inline uint32_t decode_u32_le(const uint8_t *src) {
     return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
 }
@@ -81,7 +86,6 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
     r->filter_type = header[4];
     uint32_t filter_len = decode_u32_le(header + 5);
 
-    // [Phase 9] Reject massive allocations from corrupted .meta files
     if (filter_len > 100 * 1024 * 1024) goto fail;
 
     uint64_t offset = 9;
@@ -107,7 +111,6 @@ sstable_reader_t *sstable_reader_init(const char *base_path, lsm_storage_backend
     r->index_size = decode_u32_le(idx_sz_buf);
     offset += 4;
 
-    // [Phase 9] Reject massive allocations from corrupted index headers
     if (r->index_size > 256 * 1024 * 1024) goto fail;
 
     if (r->index_size > 0) {
@@ -141,7 +144,6 @@ static lsm_cache_handle_t *sstable_reader_load_block(sstable_reader_t *r, uint64
     lsm_cache_handle_t *h = lsm_cache_get(r->env->block_cache, r->table_id, r->file_id, offset);
     if (h) return h;
 
-    // [Phase 9] Strict block size boundaries
     if (disk_size < 9 || disk_size > 128 * 1024 * 1024) return NULL;
 
     uint8_t *disk_buf = aml_malloc(disk_size);
@@ -160,7 +162,6 @@ static lsm_cache_handle_t *sstable_reader_load_block(sstable_reader_t *r, uint64
     uint8_t *uncomp_buf = NULL;
 
     if (comp_flag == 0 /* COMPRESS_NONE */) {
-        // [Phase 9] Strict sizing enforcing: uncompressed size MUST perfectly match data payload
         if (uncomp_size != disk_size - 9) {
             aml_free(disk_buf); return NULL;
         }
@@ -170,7 +171,6 @@ static lsm_cache_handle_t *sstable_reader_load_block(sstable_reader_t *r, uint64
         if (uncomp_size > 128 * 1024 * 1024) { aml_free(disk_buf); return NULL; }
         uncomp_buf = aml_malloc(uncomp_size);
 
-        // [Phase 9] Secure Signed Decompression Casts & Strict Error Checking
         int dec_bytes = LZ4_decompress_safe((const char*)disk_buf, (char*)uncomp_buf, disk_size - 9, uncomp_size);
 
         if (dec_bytes < 0 || (uint32_t)dec_bytes != uncomp_size) {
@@ -203,9 +203,11 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, u
     }
 
     uint32_t ptr = 0;
+    uint32_t next_block_ptr = 0;
     uint64_t target_block_offset = UINT64_MAX;
     uint64_t target_block_size = 0;
 
+    // Search the index blocks for the first candidate block
     while (ptr < r->index_size) {
         if (ptr + 4 > r->index_size) break;
         uint32_t iklen = decode_u32_le(r->index_buf + ptr); ptr += 4;
@@ -226,74 +228,104 @@ int sstable_reader_get(sstable_reader_t *r, const void *key, uint32_t key_len, u
         if (cmp <= 0) {
             target_block_offset = offset;
             target_block_size = disk_sz;
+            next_block_ptr = ptr;
             break;
         }
     }
 
     if (target_block_offset == UINT64_MAX) return 0;
 
-    lsm_cache_handle_t *h = sstable_reader_load_block(r, target_block_offset, target_block_size);
-    if (!h) return 0; // Missing or corrupted block cleanly returned as 'Not Found' instead of crashing
-
-    size_t block_size_st;
-    uint8_t *block_buf = (uint8_t *)lsm_cache_handle_data(h, &block_size_st);
-    uint32_t block_size = (uint32_t)block_size_st;
-
-    if (block_size < 4) { lsm_cache_handle_release(r->env->block_cache, h); return 0; }
-    uint32_t num_restarts = decode_u32_le(block_buf + block_size - 4);
-
-    // [Phase 9] Prevent unsigned math underflow! Cast to uint64_t for the check
-    if (num_restarts == 0 || ((uint64_t)num_restarts * 4) > (block_size - 4)) {
-        lsm_cache_handle_release(r->env->block_cache, h);
-        return 0; // Clean rejection of bounds-busting integer injection
-    }
-
-    uint32_t restarts_offset = block_size - 4 - (num_restarts * 4);
-    uint32_t bptr = 0;
-    char last_key[1024];
+    char last_key[MAX_INTERNAL_KEY_SIZE];
     uint32_t last_key_len = 0;
 
-    while (bptr < restarts_offset) {
-        uint32_t shared, unshared, vlen;
-        int s_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &shared); bptr += s_b;
-        int u_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &unshared); bptr += u_b;
-        int v_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &vlen); bptr += v_b;
+    // [Phase 11] Cross-block traversal for multi-version snapshot keys
+    while (target_block_offset != UINT64_MAX) {
+        lsm_cache_handle_t *h = sstable_reader_load_block(r, target_block_offset, target_block_size);
+        if (!h) return 0;
 
-        if (s_b == 0 || u_b == 0 || v_b == 0 || bptr + unshared + vlen > restarts_offset) break;
-        if (shared + unshared > 1024) break;
+        size_t block_size_st;
+        uint8_t *block_buf = (uint8_t *)lsm_cache_handle_data(h, &block_size_st);
+        uint32_t block_size = (uint32_t)block_size_st;
 
-        memcpy(last_key + shared, block_buf + bptr, unshared);
-        bptr += unshared;
-        last_key_len = shared + unshared;
+        if (block_size < 4) { lsm_cache_handle_release(r->env->block_cache, h); return 0; }
+        uint32_t num_restarts = decode_u32_le(block_buf + block_size - 4);
 
-        const uint8_t *val_ptr = block_buf + bptr;
-        bptr += vlen;
-
-        uint32_t ulen = last_key_len > 8 ? last_key_len - 8 : 0;
-        uint32_t min_len = key_len < ulen ? key_len : ulen;
-        int cmp = memcmp(key, last_key, min_len);
-        if (cmp == 0) cmp = key_len < ulen ? -1 : (key_len > ulen ? 1 : 0);
-
-        if (cmp == 0) {
-            uint64_t seq = decode_u64_le((const uint8_t*)last_key + ulen) >> 8;
-            uint8_t op = last_key[last_key_len - 8];
-            if (seq <= read_seq_num) {
-                if (op == 1 /* OP_DELETE */) {
-                    lsm_cache_handle_release(r->env->block_cache, h);
-                    return -1;
-                }
-                *out_val = aml_malloc(vlen);
-                memcpy(*out_val, val_ptr, vlen);
-                *out_vlen = vlen;
-                lsm_cache_handle_release(r->env->block_cache, h);
-                return 1;
-            }
-        } else if (cmp < 0) {
-            break;
+        if (num_restarts == 0 || ((uint64_t)num_restarts * 4) > (block_size - 4)) {
+            lsm_cache_handle_release(r->env->block_cache, h);
+            return 0;
         }
+
+        uint32_t restarts_offset = block_size - 4 - (num_restarts * 4);
+        uint32_t bptr = 0;
+        last_key_len = 0;
+
+        bool key_match_found = false;
+
+        while (bptr < restarts_offset) {
+            uint32_t shared, unshared, vlen;
+            int s_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &shared); bptr += s_b;
+            int u_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &unshared); bptr += u_b;
+            int v_b = decode_varint32(block_buf + bptr, restarts_offset - bptr, &vlen); bptr += v_b;
+
+            if (s_b == 0 || u_b == 0 || v_b == 0 || bptr + unshared + vlen > restarts_offset) break;
+
+            // [Phase 11] Strict prefix bounding validation
+            if (shared > last_key_len || shared + unshared > MAX_INTERNAL_KEY_SIZE) break;
+
+            memcpy(last_key + shared, block_buf + bptr, unshared);
+            bptr += unshared;
+            last_key_len = shared + unshared;
+
+            const uint8_t *val_ptr = block_buf + bptr;
+            bptr += vlen;
+
+            uint32_t ulen = last_key_len > 8 ? last_key_len - 8 : 0;
+            uint32_t min_len = key_len < ulen ? key_len : ulen;
+            int cmp = memcmp(key, last_key, min_len);
+            if (cmp == 0) cmp = key_len < ulen ? -1 : (key_len > ulen ? 1 : 0);
+
+            if (cmp == 0) {
+                key_match_found = true;
+                uint64_t seq = decode_u64_le((const uint8_t*)last_key + ulen) >> 8;
+                uint8_t op = last_key[last_key_len - 8];
+                if (seq <= read_seq_num) {
+                    if (op == 1 /* OP_DELETE */) {
+                        lsm_cache_handle_release(r->env->block_cache, h);
+                        return -1;
+                    }
+                    if (out_val) {
+                        *out_val = aml_malloc(vlen);
+                        memcpy(*out_val, val_ptr, vlen);
+                        *out_vlen = vlen;
+                    }
+                    lsm_cache_handle_release(r->env->block_cache, h);
+                    return 1;
+                }
+            } else if (cmp < 0) {
+                lsm_cache_handle_release(r->env->block_cache, h);
+                return 0; // Overshot the key, logical termination
+            }
+        }
+
+        lsm_cache_handle_release(r->env->block_cache, h);
+
+        // If the key was found but no MVCC versions matched, it may cross the block boundary
+        if (key_match_found && next_block_ptr < r->index_size) {
+            uint32_t ptr2 = next_block_ptr;
+            if (ptr2 + 4 <= r->index_size) {
+                uint32_t iklen = decode_u32_le(r->index_buf + ptr2); ptr2 += 4;
+                if (ptr2 + iklen + 16 <= r->index_size) {
+                    target_block_offset = decode_u64_le(r->index_buf + ptr2 + iklen);
+                    target_block_size = decode_u64_le(r->index_buf + ptr2 + iklen + 8);
+                    next_block_ptr = ptr2 + iklen + 16;
+                    continue; // Load and scan next block
+                }
+            }
+        }
+
+        break; // Key exhausted
     }
 
-    lsm_cache_handle_release(r->env->block_cache, h);
     return 0;
 }
 
@@ -307,7 +339,8 @@ struct sstable_iter_s {
     uint32_t restarts_offset;
 
     uint32_t block_ptr;
-    char key[1024];
+    // [Phase 11] Increased to support MAX bounds
+    char key[MAX_INTERNAL_KEY_SIZE];
     uint32_t key_len;
     const char *val;
     uint32_t val_len;
@@ -328,7 +361,9 @@ bool sstable_iter_next(sstable_iter_t *it) {
             int v_b = decode_varint32(it->block_buf + it->block_ptr, it->restarts_offset - it->block_ptr, &vlen); it->block_ptr += v_b;
 
             if (s_b == 0 || u_b == 0 || v_b == 0 || it->block_ptr + unshared + vlen > it->restarts_offset) break;
-            if (shared + unshared > 1024) break;
+
+            // [Phase 11] Discard invalid prefix instructions to prevent parsing crashes
+            if (shared > it->key_len || shared + unshared > MAX_INTERNAL_KEY_SIZE) break;
 
             memcpy(it->key + shared, it->block_buf + it->block_ptr, unshared);
             it->block_ptr += unshared;
@@ -360,7 +395,7 @@ bool sstable_iter_next(sstable_iter_t *it) {
         }
 
         it->handle = sstable_reader_load_block(it->r, offset, disk_sz);
-        if (!it->handle) return false; // Corrupted, skip it and gracefully exit
+        if (!it->handle) return false;
 
         size_t iter_block_sz;
         it->block_buf = (uint8_t*)lsm_cache_handle_data(it->handle, &iter_block_sz);
@@ -369,7 +404,6 @@ bool sstable_iter_next(sstable_iter_t *it) {
         if (it->block_size < 4) continue;
         uint32_t num_restarts = decode_u32_le(it->block_buf + it->block_size - 4);
 
-        // [Phase 9] Prevent unsigned math underflow! Cast to uint64_t for the check
         if (num_restarts == 0 || ((uint64_t)num_restarts * 4) > (it->block_size - 4)) {
             continue;
         }

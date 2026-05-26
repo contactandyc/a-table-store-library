@@ -108,24 +108,18 @@ This final phase formalized our testing suite, proving that the structural fixes
 
 ### Phase 11: Safety, Overflows, and Concurrency Hardening
 
-*Focus: Resolving critical memory safety vulnerabilities, integer overflows, and race conditions identified during strict concurrency and lifecycle audits.*
+*Focus: Resolving critical memory safety vulnerabilities, integer overflows, and race conditions identified during strict concurrency and lifecycle audits, while hardening the read path against multi-block snapshot fragmentation and malformed disk reads.*
 
-* **WAL Batch Serialization Overflows:** Prevented heap corruption during Group Commit. Upgraded `blob_size` and `added_size` in `lsm_db_write()` to use `size_t` with checked addition. Implemented hard caps on maximum batch sizes to completely eliminate integer wrap-around vulnerabilities when processing massive concurrent write storms or maliciously large payload values.
+* **WAL Batch Serialization Overflows:** Prevented heap corruption during Group Commit. Upgraded `blob_size` and `added_size` in `lsm_db_write()` to use `size_t` with checked addition. Implemented hard caps on maximum batch sizes (`MAX_BLOB_SIZE`) to completely eliminate integer wrap-around vulnerabilities when processing massive concurrent write storms or maliciously large payload values.
 * **Thread-Safe WAL Syncing:** Fixed a severe race condition in `pool_wal_sync()`. Previously, the code copied `active_fd`, released the lock, and called `fdatasync`. This allowed another thread to rotate or close the file descriptor simultaneously, causing data corruption or syncing the wrong file. Resolved by safely duplicating the file descriptor via `dup()` while holding the lock, ensuring the `fdatasync` call targets the exact, immutable file reference.
-* **Strict Cache Lifecycle Management:** Hardened the LRU Cache against Use-After-Free (UAF) vulnerabilities. Modified `lsm_cache_handle_release()` to use an atomic `fetch_sub` operation. If the old reference count is `<= 0`, it triggers a hard safety fault or restores the state, rather than relying on `assert(ref_count > 0)` which is completely stripped out by the compiler in `NDEBUG` release builds.
+* **Strict Cache Lifecycle Management:** Hardened the LRU Cache against Use-After-Free (UAF) vulnerabilities. Modified `lsm_cache_handle_release()` to use an atomic `fetch_sub` operation. If the old reference count is `<= 0`, it triggers a hard safety fault (`abort()`), rather than relying on `assert(ref_count > 0)` which is stripped out by the compiler in `NDEBUG` release builds.
 * **Pinned-Block Destruction Protocol:** Fixed a UAF hazard in `lsm_cache_destroy()`, which previously freed all nodes indiscriminately regardless of their `ref_count`. The cache destruction sequence now enforces a strict shutdown protocol, asserting or draining outstanding pinned blocks to guarantee active queries and background jobs are not accessing freed memory.
-
-### Phase 12: Read Path Integrity & Teardown Correctness
-
-*Focus: Guaranteeing flawless Snapshot Isolation, preventing silent data loss during shutdown, and hardening the SSTable parsing bounds.*
-
 * **Safe WAL Unregistration Sequence:** Fixed a critical data-loss vulnerability during database teardown. Previously, `lsm_db_close()` unregistered the table from the WAL *before* the final memory flushes completed. If a final flush failed (e.g., due to ENOSPC), the WAL would have already garbage-collected the data, leaving it unrecoverable. Deferring `unregister_table()` until strictly *after* the final MemTable flush and WAL checkpoint guarantees 100% data recovery under dirty shutdown scenarios.
-* **Cross-Block Snapshot Resolution:** Fixed a severe MVCC bug where snapshot reads could return "Not Found" for older data. Previously, `sstable_reader_get()` scanned only a single target block. If a single user key had hundreds of versions spanning across multiple physical blocks, a snapshot read landing in the newer block would abort prematurely. Modified the reader to seamlessly transition into subsequent blocks as long as the user key remains identical.
-* **Constant Key-Length Enforcement:** Eliminated buffer overflows and false rejections in the SSTable read path. Replaced the hardcoded `char key[1024]` arrays in the reader/iterator with the standardized `MAX_INTERNAL_KEY_SIZE` (1032 bytes), safely accommodating legal 1024-byte user keys concatenated with their 8-byte sequence trailers.
-* **Prefix Decoding Safety:** Hardened prefix-compression decoding in the SSTable iterator. Added a strict bounds check (`if (shared > last_key_len) reject`) to instantly reject corrupted blocks that attempt to reconstruct keys using uninitialized, stale, or out-of-bounds prefix memory.
-* **WAL Iterator Payload Bounding:** Armored `pool_wal_iter_next()` against malformed disk sectors. The iterator now strictly bounds `hdr.payload_len` against the physical segment/file size and evaluates the exact `pread()` return value *before* allocating memory or running the CRC32 check, blocking massive fake-allocation Out-Of-Memory (OOM) attacks.
+* **Cross-Block Snapshot Resolution:** Fixed a severe MVCC bug where snapshot reads could return "Not Found" for older data. Previously, `sstable_reader_get()` scanned only a single target block. If a single user key had hundreds of versions spanning across multiple physical blocks, a snapshot read landing in the newer block would abort prematurely. Modified the reader to seamlessly transition into subsequent blocks via index lookups as long as the user key remains identical.
+* **Constant Key-Length Enforcement & Prefix Decoding Safety:** Eliminated buffer overflows and false rejections in the SSTable read path. Replaced the hardcoded `char key[1024]` arrays in the reader/iterator with the standardized `MAX_INTERNAL_KEY_SIZE` (1032 bytes), safely accommodating legal 1024-byte user keys. Added strict bounds checks (`if (shared > last_key_len) reject`) to instantly reject corrupted blocks that attempt to reconstruct keys using uninitialized, stale, or out-of-bounds prefix memory.
+* **WAL Iterator & Meta Payload Bounding:** Armored `pool_wal_iter_next()` and `sstable_reader_init()` against malformed disk sectors. The iterators now strictly bound payload lengths against the physical segment/file sizes and evaluate the exact `pread()` return value *before* allocating memory or running CRC32 checks, blocking massive fake-allocation Out-Of-Memory (OOM) attacks.
 
-### Phase 13: Bounded Memory & Advanced Iteration (Petabyte Scale)
+### Phase 12: Bounded Memory & Advanced Iteration (Petabyte Scale)
 
 *Focus: Scaling the engine past local-disk limits by bounding RAM usage and expanding the API to support full SQL-engine queries.*
 
@@ -133,17 +127,25 @@ This final phase formalized our testing suite, proving that the structural fixes
 * **Targeted `Seek` Iterators:** Expanded the `sstable_iter_t` and `lsm_db_iter_t` APIs to support `Seek(target_key)`. Rather than scanning sequentially from the start of a table, iterators now utilize the SSTable index to instantly jump to specific key ranges in $O(\log N)$ time, vastly accelerating analytical queries and prefix scans.
 * **Reverse Iteration API:** Added `SeekForPrev()` and reverse traversal capabilities to the MemTable and SSTable iterators. This enables applications to natively execute descending queries (e.g., `ORDER BY time DESC`) without requiring expensive application-side sorting.
 
-### Phase 14: Lock-Free Concurrency & Advanced Mutators
+### Phase 13: Lock-Free Concurrency & Advanced Mutators
 
 *Focus: Maximizing multi-core insertion throughput and eliminating Write Amplification for massive deletion workloads.*
 
 * **Lock-Free CAS MemTable:** Removed the single-threaded `write_mutex` bottleneck during MemTable insertion. Upgraded the underlying SkipList to use Lock-Free Compare-And-Swap (CAS) atomic operations. This allows all followers in a Group Commit batch to insert their data concurrently into the memory arena, fully saturating modern multi-core CPUs.
 * **Range Tombstones:** Introduced a specialized metadata structure to support `OP_RANGE_DELETE` (e.g., `[start_key, end_key]`). Instead of inserting 1 million individual point-tombstones (which bloats memory and destroys I/O throughput), the database instantly drops massive ranges, passing the semantic boundary marker down the LSM tree to efficiently obliterate overlapping data during compaction.
-* **Merge Operators (Read-Modify-Write):** Implemented the `OP_MERGE` operational tag. Applications can now append delta operations (e.g., "+1 to counter" or "append to list") natively into the LSM. The read path and background compactions dynamically evaluate and collapse these deltas, eliminating the need for expensive client-side read-then-write distributed locks.
+* **Merge Operators (Read-Modify-Write):** Implemented the `OP_MERGE` operational tag. Applications can now append delta operations natively into the LSM. The read path and background compactions dynamically evaluate and collapse these deltas. This completely eliminates the need for expensive client-side read-then-write distributed locks, drastically accelerating high-throughput entity resolution pipelines and concurrent ledger aggregations.
 
-### Phase 15: Adaptive Compaction Strategies
+### Phase 14: Adaptive Compaction Strategies
 
 *Focus: Providing dynamic, workload-specific tuning to reduce disk degradation (Write Amplification) for diverse cloud environments.*
 
 * **Size-Tiered (Universal) Compaction:** Introduced Size-Tiered Compaction as a first-class alternative to Leveled Compaction. Optimized for ultra-heavy write workloads (like ingest logging and telemetry), Size-Tiered allows files of similar sizes to accumulate and merges them all at once. This drastically reduces Disk Write Amplification at the cost of slightly higher read latency.
 * **Time-Series (FIFO) Compaction:** Added a FIFO (First-In-First-Out) compaction strategy for temporal data. Rather than rewriting old data into deeper levels, the database automatically drops the oldest SSTable files entirely based on Time-To-Live (TTL) or overall disk volume limits, making it the perfect zero-overhead engine for sliding-window metrics.
+
+### Phase 15: Enterprise Observability & Heuristic Tuning
+
+*Focus: Hardening the database for multi-tenant, mission-critical environments through zero-downtime operations and intelligent self-tuning.*
+
+* **Zero-Copy Hot Backups:** Implemented a non-blocking snapshot mechanism utilizing hard links (`link()`) at the file system level. This allows external systems to capture point-in-time, perfectly consistent backups of the entire database state without halting active writes or compactions.
+* **Live Configuration & ML-Driven Tuning:** Exposed an API to safely alter memory limits, background thread counts, and block sizes at runtime without database restarts. Laid the groundwork for machine learning heuristics to automatically shift memory allocation between the MemTable and LRU Cache dynamically based on shifting read/write workload patterns.
+* **Deterministic Telemetry:** Exposed deep internal counters for cache hit rates, write amplification metrics, read latencies, and compaction bottlenecks. This enables perfect integration into external observability stacks (like Prometheus/Grafana) for strict auditability and real-time degradation alerting.

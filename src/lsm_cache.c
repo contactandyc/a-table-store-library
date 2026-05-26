@@ -194,13 +194,16 @@ void lsm_cache_handle_release(lsm_cache_t *cache, lsm_cache_handle_t *handle) {
     (void)cache; // Suppress unused parameter warning
     if (!handle) return;
 
-    int val = __atomic_load_n(&handle->ref_count, __ATOMIC_ACQUIRE);
-    (void)val;   // Suppress unused variable warning if assertions are compiled out
-    assert(val > 0 && "lsm_cache_handle_release: Underflow! Handle was double released.");
-
-    __atomic_fetch_sub(&handle->ref_count, 1, __ATOMIC_SEQ_CST);
+    // [Phase 11] Securely detect double-releases utilizing previous value evaluation
+    int old = __atomic_fetch_sub(&handle->ref_count, 1, __ATOMIC_SEQ_CST);
+    if (old <= 0) {
+        // Halt eviction evaluation on corrupted state and crash to protect invariant safety
+        __atomic_fetch_add(&handle->ref_count, 1, __ATOMIC_SEQ_CST);
+        fprintf(stderr, "FATAL: lsm_cache_handle_release: Underflow! Handle was double released.\n");
+        assert(old > 0 && "lsm_cache_handle_release: Underflow! Handle was double released.");
+        abort();
+    }
 }
-
 
 void lsm_cache_destroy(lsm_cache_t *cache) {
     if (!cache) return;
@@ -209,6 +212,15 @@ void lsm_cache_destroy(lsm_cache_t *cache) {
         cache_node_t *curr = cache->shards[i].lru_head;
         while (curr) {
             cache_node_t *next = curr->next;
+
+            // [Phase 11] Drain Protocol Validation
+            int refs = __atomic_load_n(&curr->ref_count, __ATOMIC_ACQUIRE);
+            if (refs > 0) {
+                fprintf(stderr, "FATAL: lsm_cache_destroy: Destroyed while pinned blocks remain (ref_count %d)!\n", refs);
+                assert(refs == 0 && "Cache destroyed with pinned blocks!");
+                abort();
+            }
+
             aml_free(curr->block);
             aml_free(curr);
             curr = next;

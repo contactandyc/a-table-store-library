@@ -1070,6 +1070,53 @@ MACRO_TEST(db_zero_thread_pool_executes_synchronously) {
     lsm_db_close(db);
     lsm_env_destroy(env);
 }
+// Map the internal structures to allow adversarial fuzzing of the opaque pointer
+typedef struct {
+    uint8_t type;
+    void *key;
+    uint32_t klen;
+    void *val;
+    uint32_t vlen;
+} test_batch_entry_t;
+
+typedef struct {
+    test_batch_entry_t *entries;
+    size_t count;
+    size_t capacity;
+} test_write_batch_t;
+
+MACRO_TEST(db_wal_rejects_oversized_batches) {
+    cleanup_db();
+    lsm_env_t *env = lsm_env_init(4 * 1024 * 1024, 16 * 1024 * 1024, 2,
+                                  &local_posix_backend, &local_posix_backend, 2, NULL);
+    lsm_db_t *db = lsm_db_open(env, 1, "/tmp/lsm_db_test");
+
+    lsm_write_batch_t *b = lsm_write_batch_init();
+    test_write_batch_t *tb = (test_write_batch_t *)b;
+
+    // Create a malicious batch entry requesting an impossibly large memory payload
+    // to attempt to trigger an integer overflow or massive heap allocation.
+    uint32_t malicious_size = 200 * 1024 * 1024; // 200MB (Exceeds 128MB MAX_BLOB_SIZE)
+
+    tb->count = 1;
+    tb->entries[0].type = 0; // 0 matches OP_PUT
+    tb->entries[0].klen = 4;
+    tb->entries[0].key = aml_malloc(4);
+    memcpy(tb->entries[0].key, "OOM!", 4);
+    tb->entries[0].vlen = malicious_size;
+    tb->entries[0].val = NULL; // Not actually allocating 200MB here!
+
+    // The newly hardened lsm_db_write should detect that this entry exceeds
+    // the mathematical bounds and cleanly return false without crashing.
+    bool success = lsm_db_write(db, b);
+
+    MACRO_ASSERT_FALSE(success);
+
+    // lsm_write_batch_destroy safely frees the key and ignores the NULL value
+    lsm_write_batch_destroy(b);
+    lsm_db_close(db);
+    lsm_env_destroy(env);
+}
 
 int main(void) {
     macro_test_case tests[256];
@@ -1103,6 +1150,8 @@ int main(void) {
 
     MACRO_ADD(tests, db_failed_flush_maintains_contiguous_durability);
     MACRO_ADD(tests, db_zero_thread_pool_executes_synchronously);
+
+    MACRO_ADD(tests, db_wal_rejects_oversized_batches);
 
     macro_run_all("lsm_database_integration", tests, test_count);
     return 0;

@@ -175,8 +175,21 @@ bool pool_wal_iter_next(pool_wal_iter_t* iter, uint64_t* seq, uint64_t* lsn, uin
             continue;
         }
 
+        // [Phase 11] Explicitly bound payload memory allocations against physical segment limits
+        if (hdr.payload_len > iter->wal->segment_size_bytes ||
+            iter->offset + sizeof(hdr) + hdr.payload_len > iter->wal->segment_size_bytes) {
+            close(iter->fd); iter->fd = -1;
+            return false;
+        }
+
         uint8_t* p = aml_malloc(hdr.payload_len);
-        pread(iter->fd, p, hdr.payload_len, iter->offset + sizeof(hdr));
+
+        // [Phase 11] Strict exact-byte return validation
+        if (pread(iter->fd, p, hdr.payload_len, iter->offset + sizeof(hdr)) != (ssize_t)hdr.payload_len) {
+            aml_free(p);
+            close(iter->fd); iter->fd = -1;
+            return false;
+        }
 
         if (hdr.frame_crc != crc32(p, hdr.payload_len)) {
             aml_free(p);
@@ -333,13 +346,33 @@ void pool_wal_purge(pool_wal_t* wal, uint64_t safe_lsn) {
 void pool_wal_sync(pool_wal_t* wal) {
     pthread_mutex_lock(&wal->mu);
     int fd = wal->active_fd;
-    pthread_mutex_unlock(&wal->mu); // Release lock before blocking I/O!
-    if (fd >= 0) {
+    int dup_fd = -1;
+
+    // [Phase 11] Safely duplicate the FD before unlocking so fdatasync
+    // cannot target a closed or recycled descriptor during concurrent rotation.
+    if (fd >= 0) dup_fd = dup(fd);
+
+    pthread_mutex_unlock(&wal->mu);
+
+    if (dup_fd >= 0) {
 #ifdef __APPLE__
-        fcntl(fd, F_FULLFSYNC, 0);
+        fcntl(dup_fd, F_FULLFSYNC, 0);
 #else
-        fdatasync(fd);
+        fdatasync(dup_fd);
 #endif
+        close(dup_fd);
+    } else if (fd >= 0) {
+        // Fallback: If dup() fails (e.g. process hit max open files),
+        // sync strictly under the lock to preserve safety.
+        pthread_mutex_lock(&wal->mu);
+        if (wal->active_fd == fd) {
+#ifdef __APPLE__
+            fcntl(fd, F_FULLFSYNC, 0);
+#else
+            fdatasync(fd);
+#endif
+        }
+        pthread_mutex_unlock(&wal->mu);
     }
 }
 

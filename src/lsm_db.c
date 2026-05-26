@@ -455,11 +455,8 @@ void lsm_db_close(lsm_db_t *db) {
     db->closing = true;
     pthread_mutex_unlock(&db->state_mutex);
 
-    lsm_env_unregister_db(db->env, db);
-
-    if (db->env->global_wal && db->env->global_wal->unregister_table) {
-        db->env->global_wal->unregister_table(db->env->global_wal, db->table_id);
-    }
+    // [Phase 11] Unregisteration moved to strictly the bottom!
+    // lsm_env_unregister_db(db->env, db);
 
     pthread_mutex_lock(&db->state_mutex);
     while (db->active_ops > 0) {
@@ -473,7 +470,6 @@ void lsm_db_close(lsm_db_t *db) {
 
     pthread_mutex_lock(&db->write_mutex);
 
-    // [Phase 8] Contiguous Durability Fix
     bool can_flush_final = (db->imm_memtable == NULL);
     bool need_submit = false;
 
@@ -498,10 +494,9 @@ void lsm_db_close(lsm_db_t *db) {
     }
     pthread_mutex_unlock(&db->write_mutex);
 
-    // Completely lock-free submission
     if (need_submit) {
         if (!lsm_pool_submit(db->env->bg_pool, perform_flush_job, db, JOB_PRIORITY_URGENT)) {
-            perform_flush_job(db); // Synchronous fallback
+            perform_flush_job(db);
         }
     }
 
@@ -510,7 +505,9 @@ void lsm_db_close(lsm_db_t *db) {
         pthread_cond_wait(&db->stall_cond, &db->state_mutex);
     }
 
-    // [Phase 8] Safe memory reclamation without WAL checkpointing
+    // [Phase 11] Safe to unregister if ALL pending data was safely flushed.
+    bool safe_to_unregister = (db->imm_memtable == NULL && memtable_first(db->memtable) == NULL);
+
     if (db->imm_memtable != NULL) {
         atomic_fetch_sub(&db->env->global_mem_usage, memtable_get_memory_usage(db->imm_memtable));
         memtable_release(db->imm_memtable);
@@ -538,6 +535,13 @@ void lsm_db_close(lsm_db_t *db) {
         pthread_mutex_destroy(&db->manifest->version_mutex);
         aml_free((void *)db->manifest->db_directory);
         aml_free(db->manifest);
+    }
+
+    // [Phase 11] Unregister strictly at the very end to guarantee WAL checkpoint preservation
+    // if `imm_memtable` was stranded and we need to flawlessly recover upon reboot.
+    lsm_env_unregister_db(db->env, db);
+    if (safe_to_unregister && db->env->global_wal && db->env->global_wal->unregister_table) {
+        db->env->global_wal->unregister_table(db->env->global_wal, db->table_id);
     }
 
     lsm_db_release(db);
@@ -762,14 +766,36 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
 
     lsm_writer_t *curr = db->writer_queue_head;
     lsm_writer_t *last_writer = curr;
+
+    // [Phase 11] Bounding and overflow protection for WAL serialization
     size_t total_count = 0;
-    uint32_t blob_size = 12;
+    size_t blob_size = 12; // 8 bytes (seq) + 4 bytes (count)
+    const size_t MAX_BLOB_SIZE = 128 * 1024 * 1024; // 128 MB max physical block
+    bool oversized_batch = false;
 
     while (curr != NULL) {
-        uint32_t added_size = 0;
+        size_t added_size = 0;
+        bool overflow = false;
+
         for (size_t i = 0; i < curr->batch->count; i++) {
-            added_size += 1 + 4 + 4 + curr->batch->entries[i].klen + curr->batch->entries[i].vlen;
+            size_t entry_sz = 9 + (size_t)curr->batch->entries[i].klen + (size_t)curr->batch->entries[i].vlen;
+            if (SIZE_MAX - added_size < entry_sz) { overflow = true; break; }
+            added_size += entry_sz;
         }
+
+        if (overflow || SIZE_MAX - blob_size < added_size || blob_size + added_size > MAX_BLOB_SIZE ||
+            total_count + curr->batch->count < total_count ||
+            total_count + curr->batch->count > 0xFFFFFFFFULL) {
+
+            if (total_count == 0) {
+                // The very first batch is mathematically un-serializable. Reject it immediately.
+                total_count = curr->batch->count;
+                last_writer = curr;
+                oversized_batch = true;
+            }
+            break;
+        }
+
         if (total_count > 0 && blob_size + added_size > 1024 * 1024) break;
 
         blob_size += added_size;
@@ -794,14 +820,14 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
         pthread_cond_wait(&db->commit_cv, &db->write_mutex);
     }
 
-    bool write_success = true;
+    bool write_success = !oversized_batch;
     uint64_t start_seq = db->current_seq;
-    db->current_seq += total_count;
+    if (write_success) db->current_seq += total_count;
     uint64_t assigned_lsn = 0;
 
-    if (db->env->global_wal && db->env->global_wal->append) {
+    if (write_success && db->env->global_wal && db->env->global_wal->append) {
         uint8_t *blob = aml_malloc(blob_size);
-        uint32_t ptr = 0;
+        size_t ptr = 0;
 
         uint64_t wal_seq = start_seq + 1;
         blob[0] = wal_seq & 0xFF; blob[1] = (wal_seq >> 8) & 0xFF;
@@ -810,7 +836,8 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
         blob[6] = (wal_seq >> 48) & 0xFF; blob[7] = (wal_seq >> 56) & 0xFF;
         ptr += 8;
 
-        encode_u32_le_db(blob + ptr, total_count); ptr += 4;
+        // Guaranteed to fit via the overflow checks
+        encode_u32_le_db(blob + ptr, (uint32_t)total_count); ptr += 4;
 
         curr = &w;
         while (curr != NULL) {
@@ -831,7 +858,7 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
             curr = curr->next;
         }
 
-        if (!db->env->global_wal->append(db->env->global_wal, db->table_id, wal_seq, 2 /* OP_BATCH */, NULL, 0, blob, blob_size, &assigned_lsn)) {
+        if (!db->env->global_wal->append(db->env->global_wal, db->table_id, wal_seq, 2 /* OP_BATCH */, NULL, 0, blob, (uint32_t)blob_size, &assigned_lsn)) {
             write_success = false;
         }
         aml_free(blob);
@@ -856,8 +883,6 @@ bool lsm_db_write(lsm_db_t *db, lsm_write_batch_t *batch) {
             curr = curr->next;
         }
         diff = memtable_get_memory_usage(db->memtable) - mem_before;
-    } else {
-        db->current_seq -= total_count;
     }
 
     db->commit_ticket_tail++;

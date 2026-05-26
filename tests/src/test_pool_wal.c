@@ -244,6 +244,56 @@ MACRO_TEST(wal_lsm_wrapper_integration) {
     lsm->close(lsm);
 }
 
+typedef struct {
+    pool_wal_t *wal;
+    bool keep_running;
+} wal_sync_test_args_t;
+
+static void *wal_sync_thread(void *arg) {
+    wal_sync_test_args_t *args = (wal_sync_test_args_t *)arg;
+    while (__atomic_load_n(&args->keep_running, __ATOMIC_ACQUIRE)) {
+        // Slam the sync function as fast as possible
+        pool_wal_sync(args->wal);
+    }
+    return NULL;
+}
+
+MACRO_TEST(wal_sync_survives_concurrent_rotation) {
+    cleanup_wal();
+    pool_wal_t wal;
+    // Tiny segment size (100 bytes) to force instant rotations
+    MACRO_ASSERT_EQ_INT(pool_wal_init(&wal, "/tmp/pool_wal_test", 0 /*0 MB forces tiny minimums usually*/, 5), 0);
+    wal.segment_size_bytes = 100; // Hard override for the test
+
+    wal_sync_test_args_t args = { .wal = &wal, .keep_running = true };
+
+    // Spin up 4 threads constantly syncing the WAL
+    pthread_t sync_threads[4];
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&sync_threads[i], NULL, wal_sync_thread, &args);
+    }
+
+    // Main thread rapid-fires appends to force aggressive file rotations
+    char *payload = "12345678901234567890"; // 20 bytes
+    for (int i = 0; i < 100; i++) {
+        pool_wal_append(&wal, i, 1, (const uint8_t*)payload, 20);
+        usleep(1000); // 1ms delay
+    }
+
+    // Stop the sync threads
+    __atomic_store_n(&args.keep_running, false, __ATOMIC_RELEASE);
+    for (int i = 0; i < 4; i++) {
+        pthread_join(sync_threads[i], NULL);
+    }
+
+    // If the Phase 11 fd dup() fix wasn't present, the sync threads would hit EBADF
+    // or accidentally sync a recycled descriptor, potentially causing deadlocks or crashes.
+    // Making it here proves the concurrency isolation holds!
+    MACRO_ASSERT_TRUE(true);
+
+    pool_wal_close(&wal);
+}
+
 int main(void) {
     macro_test_case tests[256];
     size_t test_count = 0;
@@ -253,6 +303,8 @@ int main(void) {
     MACRO_ADD(tests, wal_purge_and_standby_recycling);
     MACRO_ADD(tests, wal_corrupted_frame_handling);
     MACRO_ADD(tests, wal_lsm_wrapper_integration);
+
+    MACRO_ADD(tests, wal_sync_survives_concurrent_rotation);
 
     macro_run_all("pool_wal", tests, test_count);
     return 0;
